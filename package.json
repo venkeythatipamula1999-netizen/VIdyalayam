@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "Venkeys International School App - React Native (Expo)",
   "main": "node_modules/expo/AppEntry.js",
+  "engines": {
+    "node": ">=20.x"
+  },
   "scripts": {
     "start": "node server.js",
     "start:backend": "node server.js",
