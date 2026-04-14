@@ -12,7 +12,7 @@
     "start:app": "npx expo start --web --port 5000",
     "start:admin": "npm --prefix admin-dashboard run dev",
     "start:all": "concurrently --names \"BACKEND,APP,ADMIN\" --prefix-colors \"cyan,green,magenta\" \"npm run start:backend\" \"npm run start:app\" \"npm run start:admin\"",
-    "build": "npx expo export --platform web --output-dir dist",
+    "build": "npx expo export --platform web --output-dir public",
     "dev": "npx expo start --web --port 5000",
     "android": "expo run:android",
     "ios": "expo run:ios",
