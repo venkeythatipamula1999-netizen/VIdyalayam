@@ -26,8 +26,11 @@ function cacheDel(prefix) {
 }
 const { runDailyBackup } = require('./src/services/firestoreBackup');
 const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) throw new Error('[FATAL] JWT_SECRET environment variable is not set');
-console.log(`[JWT Debug] Secret Length: ${JWT_SECRET.length}, Prefix: ${JWT_SECRET.substring(0, 3)}`);
+if (!JWT_SECRET) {
+  console.warn('[WARNING] JWT_SECRET environment variable is not set. Auth will fail.');
+} else {
+  console.log(`[JWT Debug] Secret Length: ${JWT_SECRET.length}, Prefix: ${JWT_SECRET.substring(0, 3)}`);
+}
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
