@@ -210,11 +210,11 @@ export default function AdminStudents({ onBack, classItem }) {
             <Text style={{ color: C.gold, fontWeight: '600' }}>rollNumber</Text>.{' '}
             Optional: <Text style={{ color: C.teal }}>parentPhone</Text>{'\n'}
             Add marks columns as{' '}
-            <Text style={{ color: C.teal, fontWeight: '600' }}>Unit1_Maths</Text>,{' '}
-            <Text style={{ color: C.teal, fontWeight: '600' }}>Unit2_Science</Text>, etc.
+            <Text style={{ color: C.teal, fontWeight: '600' }}>FA1_Maths</Text>,{' '}
+            <Text style={{ color: C.teal, fontWeight: '600' }}>FA2_Science</Text>, etc.
           </Text>
           <View style={st.importFormat}>
-            <Text style={st.importFormatRow}>name, rollNumber, parentPhone, Unit1_Maths, Unit2_Maths, Unit1_Science</Text>
+            <Text style={st.importFormatRow}>name, rollNumber, parentPhone, FA1_Maths, FA2_Maths, FA1_Science</Text>
             <Text style={st.importFormatRow}>Arjun Kumar, 1, 9876543210, 18, 16, 19</Text>
             <Text style={st.importFormatRow}>Priya Nair, 2, 9876543211, 20, 17,</Text>
           </View>

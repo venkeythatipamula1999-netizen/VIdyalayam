@@ -1,9 +1,22 @@
-const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 
 const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 
 let _doc = null;
+let _GoogleSpreadsheet = null;
+
+async function getGoogleSpreadsheet() {
+  if (_GoogleSpreadsheet) return _GoogleSpreadsheet;
+
+  const mod = await import('google-spreadsheet');
+  _GoogleSpreadsheet = mod.GoogleSpreadsheet || mod.default?.GoogleSpreadsheet || mod.default;
+
+  if (!_GoogleSpreadsheet) {
+    throw new Error('Failed to load google-spreadsheet module');
+  }
+
+  return _GoogleSpreadsheet;
+}
 
 async function getDoc() {
   if (!SPREADSHEET_ID) {
@@ -23,6 +36,7 @@ async function getDoc() {
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
 
+  const GoogleSpreadsheet = await getGoogleSpreadsheet();
   const doc = new GoogleSpreadsheet(SPREADSHEET_ID, auth);
   await doc.loadInfo();
   _doc = doc;

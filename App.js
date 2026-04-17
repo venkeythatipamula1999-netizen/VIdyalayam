@@ -346,10 +346,6 @@ export default function App() {
         return <ParentLoginScreen onLoginSuccess={handleLoginSuccess} onBack={() => navigate('parent-portal')} onNavigate={navigate} />;
       case 'teacher-login':
         return <LoginScreen role="teacher" onLoginSuccess={handleLoginSuccess} onBack={() => navigate('splash')} onNavigate={navigate} />;
-      case 'driver-login':
-        return <LoginScreen role="driver" onLoginSuccess={handleLoginSuccess} onBack={() => navigate('splash')} onNavigate={navigate} />;
-      case 'cleaner-login':
-        return <LoginScreen role="cleaner" onLoginSuccess={handleLoginSuccess} onBack={() => navigate('splash')} onNavigate={navigate} />;
       case 'signup':
         return <SignupScreen onSignup={handleSignupSuccess} onBack={() => navigate(role === 'teacher' ? 'teacher-login' : 'parent-login')} />;
       case 'complete-profile':

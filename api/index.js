@@ -26,6 +26,15 @@ function cacheDel(prefix) {
 }
 const { runDailyBackup } = require('../src/services/firestoreBackup');
 const JWT_SECRET = process.env.JWT_SECRET;
+const PORT = process.env.PORT || 5001;
+
+function normalizeMultilineSecret(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^"+|"+$/g, '')
+    .replace(/\\n/g, '\n');
+}
+
 if (!JWT_SECRET) {
   console.warn('[WARNING] JWT_SECRET environment variable is not set. Auth will fail.');
 } else {
@@ -69,14 +78,6 @@ const apiLimiter = rateLimit({
   legacyHeaders: false
 });
 
-const superAdminLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 50,
-  message: { error: 'Too many super admin requests.' },
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 5,
@@ -116,12 +117,7 @@ const verifyAuth = async (req, res, next) => {
   }
 };
 
-const verifySuperAdmin = (req, res, next) => {
-  const key = req.headers['x-super-admin-key'];
-  if (!key) return res.status(401).json({ error: 'Super admin key required' });
-  if (key !== process.env.SUPER_ADMIN_KEY) return res.status(403).json({ error: 'Invalid super admin key' });
-  next();
-};
+
 
 const admin = require('firebase-admin');
 const { sendAndLog } = require('../services/whatsappService');
@@ -133,7 +129,7 @@ try {
       credential: admin.credential.cert({
         projectId: process.env.FIREBASE_PROJECT_ID,
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n')
+        privateKey: normalizeMultilineSecret(process.env.FIREBASE_PRIVATE_KEY)
       })
     });
   }
@@ -290,7 +286,6 @@ app.get('/api/auth/me', verifyAuth, async (req, res) => {
 });
 
 const productionOrigins = [
-  'https://super-admin-with-error-tracking-8b9.vercel.app',
   process.env.APP_URL,
 ].filter(Boolean);
 
@@ -302,21 +297,21 @@ const developmentOrigins = [
   'http://localhost:19006',
 ];
 
-const allowedOrigins = process.env.NODE_ENV === 'production'
+const allowedOrigins2 = process.env.NODE_ENV === 'production'
   ? productionOrigins
   : [...productionOrigins, ...developmentOrigins];
 
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    if (allowedOrigins.some(o => origin.startsWith(o))) {
+    if (allowedOrigins2.some(o => origin.startsWith(o))) {
       return callback(null, true);
     }
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-role-id', 'x-super-admin-key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-role-id']
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -324,7 +319,6 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(mongoSanitize());
 app.use((req, res, next) => {
   if (
-    req.path.startsWith('/api/super') ||
     req.path.startsWith('/api/login') ||
     req.path.startsWith('/api/admin/login') ||
     req.path.startsWith('/api/parent') ||
@@ -2662,13 +2656,215 @@ app.post('/api/students/bulk-upload/:classId', upload.single('file'), async (req
   }
 });
 
+const STANDARD_SUBJECTS = [
+  { id: 'telugu', label: 'Telugu' },
+  { id: 'hindi', label: 'Hindi' },
+  { id: 'english', label: 'English' },
+  { id: 'mathematics', label: 'Mathematics' },
+  { id: 'science', label: 'Science' },
+  { id: 'social', label: 'Social Studies' },
+  { id: 'urdu', label: 'Urdu' },
+  { id: 'sanskrit', label: 'Sanskrit' },
+  { id: 'drawing', label: 'Drawing' },
+  { id: 'pt', label: 'Physical Education' },
+];
+
+function getSubjectLabel(subjectId) {
+  return STANDARD_SUBJECTS.find((subject) => subject.id === subjectId)?.label || subjectId;
+}
+
+function normalizeSubjectId(subject) {
+  const key = String(subject || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '');
+
+  const map = {
+    telugu: 'telugu',
+    hindi: 'hindi',
+    english: 'english',
+    eng: 'english',
+    mathematics: 'mathematics',
+    maths: 'mathematics',
+    math: 'mathematics',
+    science: 'science',
+    social: 'social',
+    socialstudies: 'social',
+    socialscience: 'social',
+    urdu: 'urdu',
+    sanskrit: 'sanskrit',
+    drawing: 'drawing',
+    art: 'drawing',
+    pt: 'pt',
+    pe: 'pt',
+    physicaleducation: 'pt',
+  };
+
+  return map[key] || '';
+}
+
+function normalizeSubjectIds(subjects) {
+  const list = Array.isArray(subjects) ? subjects : [subjects];
+  return [...new Set(list.map(normalizeSubjectId).filter(Boolean))];
+}
+
+function getCurrentAcademicYearLabel() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  if (month >= 5) return `${year}-${String(year + 1).slice(2)}`;
+  return `${year - 1}-${String(year).slice(2)}`;
+}
+
+async function getTeacherUserByRoleId(roleId) {
+  const snap = await db.collection('users').where('role_id', '==', roleId).limit(1).get();
+  if (snap.empty) return null;
+  const docSnap = snap.docs[0];
+  return { docId: docSnap.id, data: docSnap.data(), ref: db.collection('users').doc(docSnap.id) };
+}
+
+async function syncTeacherAggregateDoc({ schoolId, roleId, teacherDocId, subjects, assignment }) {
+  const ref = db.collection('schools').doc(schoolId).collection('teacher_subjects').doc(roleId);
+  const snap = await ref.get();
+  const current = snap.exists ? snap.data() : {};
+  const currentSubjects = normalizeSubjectIds(current.subjects || []);
+  const nextSubjects = normalizeSubjectIds([...(subjects || []), ...currentSubjects]);
+  const currentAssignments = Array.isArray(current.assignedClasses) ? current.assignedClasses : [];
+
+  let nextAssignments = currentAssignments;
+  if (assignment) {
+    nextAssignments = [
+      ...currentAssignments.filter((item) =>
+        !(item.classId === assignment.classId &&
+          item.subject === assignment.subject &&
+          (item.academicYear || getCurrentAcademicYearLabel()) === assignment.academicYear)
+      ),
+      assignment,
+    ];
+  }
+
+  await ref.set({
+    teacherId: roleId,
+    teacherDocId: teacherDocId || current.teacherDocId || '',
+    subjects: nextSubjects,
+    assignedClasses: nextAssignments,
+    schoolId,
+    updatedAt: new Date().toISOString(),
+  }, { merge: true });
+
+  return { subjects: nextSubjects, assignedClasses: nextAssignments };
+}
+
+async function syncTeacherCceAssignment({ schoolId, teacherDocId, teacherRoleId, subjectId, classId, className, academicYear }) {
+  if (!teacherDocId || !subjectId || !classId || !academicYear) return;
+
+  const ref = db.collection('schools')
+    .doc(schoolId)
+    .collection('teacher_subjects')
+    .doc(`cce_${teacherDocId}_${subjectId}_${classId}_${academicYear}`);
+
+  await ref.set({
+    teacherId: teacherDocId,
+    teacherRoleId: teacherRoleId || '',
+    subjectId,
+    classId,
+    className: className || classId,
+    academicYear,
+    schoolId,
+    assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+}
+
 app.post('/api/assign-classes', async (req, res) => {
   try {
     if (req.userRole !== 'principal' && req.userRole !== 'admin') {
       return res.status(403).json({ error: 'Only admin or principal can assign classes' });
     }
-    const { roleId, classes } = req.body;
-    console.log('Assign classes request:', { roleId, classes });
+    const {
+      roleId,
+      classes,
+      teacherId,
+      classId,
+      className,
+      subject,
+      schoolId: bodySchoolId,
+      academicYear,
+    } = req.body;
+    console.log('Assign classes request:', { roleId, classes, teacherId, classId, subject });
+
+    if (teacherId && classId && subject) {
+      const schoolId = bodySchoolId || req.schoolId || DEFAULT_SCHOOL_ID;
+      const teacherUser = await getTeacherUserByRoleId(teacherId);
+      if (!teacherUser) {
+        return res.status(404).json({ error: `No user found with role_id: ${teacherId}` });
+      }
+
+      const subjectId = normalizeSubjectId(subject);
+      if (!subjectId) {
+        return res.status(400).json({ error: 'A valid subject is required' });
+      }
+
+      const classRef = db.collection('classes').doc(classId);
+      const classSnap = await classRef.get();
+      const resolvedClassName = className || (classSnap.exists ? classSnap.data().name || classId : classId);
+      const teacherSubjects = normalizeSubjectIds(teacherUser.data.subjects || teacherUser.data.subject || []);
+      const yearLabel = academicYear || getCurrentAcademicYearLabel();
+
+      if (teacherSubjects.length > 0 && !teacherSubjects.includes(subjectId)) {
+        return res.status(400).json({ error: `${teacherId} is not qualified for ${getSubjectLabel(subjectId)}` });
+      }
+
+      const aggregate = await syncTeacherAggregateDoc({
+        schoolId,
+        roleId: teacherId,
+        teacherDocId: teacherUser.docId,
+        subjects: teacherSubjects,
+        assignment: {
+          classId,
+          className: resolvedClassName,
+          subject: subjectId,
+          academicYear: yearLabel,
+          assignedAt: new Date().toISOString(),
+        },
+      });
+
+      await syncTeacherCceAssignment({
+        schoolId,
+        teacherDocId: teacherUser.docId,
+        teacherRoleId: teacherId,
+        subjectId,
+        classId,
+        className: resolvedClassName,
+        academicYear: yearLabel,
+      });
+
+      const assignedClasses = [
+        ...new Set([...(teacherUser.data.assignedClasses || []).filter(Boolean), resolvedClassName]),
+      ];
+
+      await teacherUser.ref.update({
+        assignedClasses,
+        subjects: aggregate.subjects,
+        subject: aggregate.subjects[0] || '',
+      });
+
+      if (classSnap.exists) {
+        const classData = classSnap.data();
+        const teachers = Array.isArray(classData.teachers) ? classData.teachers : [];
+        const nextTeachers = teachers.filter((item) => !(item.teacherId === teacherId && item.subject === subjectId));
+        nextTeachers.push({ teacherId, subject: subjectId, isClassTeacher: false });
+        await classRef.set({ teachers: nextTeachers }, { merge: true });
+      }
+
+      return res.json({
+        success: true,
+        teacherId,
+        classId,
+        className: resolvedClassName,
+        subject: subjectId,
+        academicYear: yearLabel,
+      });
+    }
 
     if (!roleId) {
       return res.status(400).json({ error: 'Teacher role ID is required' });
@@ -2749,6 +2945,7 @@ app.get('/api/teacher/profile', async (req, res) => {
       classTeacherOf: data.classTeacherOf || null,
       timetable: data.timetable || [],
       assignedClasses: data.assignedClasses || [],
+      subjects: normalizeSubjectIds(data.subjects || data.subject || []),
       subject: data.subject || '',
       full_name: data.full_name || '',
       role_id: data.role_id || roleId,
@@ -2863,6 +3060,67 @@ app.get('/api/teacher/classes', async (req, res) => {
   } catch (err) {
     console.error('Teacher classes error:', err.message);
     res.status(500).json({ error: 'Failed to fetch teacher classes' });
+  }
+});
+
+app.get('/api/teacher/subjects', async (req, res) => {
+  try {
+    const roleId = req.query.roleId || req.roleId;
+    if (!roleId) return res.status(400).json({ error: 'roleId is required' });
+
+    const schoolId = req.schoolId || DEFAULT_SCHOOL_ID;
+    const aggregateSnap = await db.collection('schools').doc(schoolId).collection('teacher_subjects').doc(roleId).get();
+    if (aggregateSnap.exists) {
+      return res.json({ subjects: normalizeSubjectIds(aggregateSnap.data().subjects || []) });
+    }
+
+    const teacherUser = await getTeacherUserByRoleId(roleId);
+    if (!teacherUser) {
+      return res.json({ subjects: [] });
+    }
+
+    res.json({ subjects: normalizeSubjectIds(teacherUser.data.subjects || teacherUser.data.subject || []) });
+  } catch (err) {
+    console.error('Teacher subjects error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch teacher subjects' });
+  }
+});
+
+app.get('/api/teacher/assignments', async (req, res) => {
+  try {
+    const roleId = req.query.roleId || req.roleId;
+    if (!roleId) return res.status(400).json({ error: 'roleId is required' });
+
+    const schoolId = req.schoolId || DEFAULT_SCHOOL_ID;
+    const aggregateSnap = await db.collection('schools').doc(schoolId).collection('teacher_subjects').doc(roleId).get();
+    if (!aggregateSnap.exists) {
+      return res.json({ assignments: [] });
+    }
+
+    const data = aggregateSnap.data();
+    const rawAssignments = Array.isArray(data.assignedClasses) ? data.assignedClasses : [];
+    const assignments = await Promise.all(rawAssignments.map(async (assignment) => {
+      let resolvedClassName = assignment.className || assignment.classId;
+      try {
+        const classSnap = await db.collection('classes').doc(assignment.classId).get();
+        if (classSnap.exists) {
+          resolvedClassName = classSnap.data().name || resolvedClassName;
+        }
+      } catch (_) {}
+
+      return {
+        classId: assignment.classId,
+        className: resolvedClassName,
+        subject: assignment.subject,
+        subjectLabel: getSubjectLabel(assignment.subject),
+        academicYear: assignment.academicYear || getCurrentAcademicYearLabel(),
+      };
+    }));
+
+    res.json({ assignments });
+  } catch (err) {
+    console.error('Teacher assignments error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch teacher assignments' });
   }
 });
 
@@ -3008,6 +3266,137 @@ app.post('/api/save-timetable', async (req, res) => {
   }
 });
 
+// ── GET /api/teacher/class-comprehensive/:classId ──────────────────────────
+// Returns all marks for a teacher's assigned class across all subjects & exams
+app.get('/api/teacher/class-comprehensive/:classId', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const sid = req.schoolId || DEFAULT_SCHOOL_ID;
+    const role = req.userRole || '';
+    const userId = req.userId || '';
+
+    // Authorization: Teacher must be assigned to this class
+    if (!['principal', 'admin', 'staff'].includes(role)) {
+      const userDoc = await db.collection('users').doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(403).json({ error: 'User not found' });
+      }
+      const userData = userDoc.data();
+      const assignedClasses = (userData.assignedClasses || []).map(c => c.trim().toLowerCase());
+      const timetable = userData.timetable || [];
+      const classNorm = classId.replace(/^Grade\s*/i, '').trim().toLowerCase();
+      const hasClassAccess = assignedClasses.some(ac => ac.replace(/^Grade\s*/i, '').trim() === classNorm) ||
+        timetable.some(t => (t.className || '').replace(/^Grade\s*/i, '').trim().toLowerCase() === classNorm);
+      if (!hasClassAccess) {
+        return res.status(403).json({ error: 'You are not assigned to this class' });
+      }
+    }
+
+    // Fetch all marks for this class from CCE collection
+    const marksSnap = await db.collection('schools').doc(sid)
+      .collection('cce_marks')
+      .where('classId', '==', classId)
+      .get();
+
+    // Fetch all students in this class
+    const studentsSnap = await db.collection('students')
+      .where('classId', '==', classId)
+      .where('schoolId', '==', sid)
+      .get();
+
+    // Build student list
+    const studentMap = {};
+    studentsSnap.docs.forEach(doc => {
+      const s = doc.data();
+      studentMap[s.studentId || s.id] = {
+        studentId: s.studentId || s.id,
+        studentName: s.studentName || s.full_name || s.name || 'Unknown',
+        rollNumber: s.rollNumber || s.roll || 0,
+      };
+    });
+
+    // Organize marks by student, subject, and exam
+    const marksByStudent = {};
+    const subjectSet = new Set();
+    const examSet = new Set();
+    const academicYears = new Set();
+
+    marksSnap.docs.forEach(doc => {
+      const m = doc.data();
+      const studentId = m.studentId;
+      const subject = m.subjectId || '';
+      const exam = m.examType || '';
+      const year = m.academicYear || '';
+
+      if (!marksByStudent[studentId]) {
+        marksByStudent[studentId] = studentMap[studentId] || { studentId, studentName: 'Unknown', rollNumber: 0 };
+        marksByStudent[studentId].subjectMarks = {};
+      }
+
+      if (!marksByStudent[studentId].subjectMarks[subject]) {
+        marksByStudent[studentId].subjectMarks[subject] = {};
+      }
+
+      marksByStudent[studentId].subjectMarks[subject][exam] = {
+        marks: m.marks || 0,
+        maxMarks: m.maxMarks || 20,
+        examType: exam,
+        subjectId: subject,
+        updatedAt: m.updatedAt,
+      };
+
+      subjectSet.add(subject);
+      examSet.add(exam);
+      academicYears.add(year);
+    });
+
+    // Calculate subject averages
+    const subjectAverages = {};
+    Array.from(subjectSet).forEach(subject => {
+      let total = 0;
+      let count = 0;
+      Object.values(marksByStudent).forEach(student => {
+        Object.values(student.subjectMarks[subject] || {}).forEach(mark => {
+          total += mark.marks || 0;
+          count++;
+        });
+      });
+      subjectAverages[subject] = count > 0 ? Math.round(total / count) : 0;
+    });
+
+    // Calculate exam averages
+    const examAverages = {};
+    Array.from(examSet).forEach(exam => {
+      let total = 0;
+      let count = 0;
+      Object.values(marksByStudent).forEach(student => {
+        Object.values(student.subjectMarks).forEach(subjectMarks => {
+          if (subjectMarks[exam]) {
+            total += subjectMarks[exam].marks || 0;
+            count++;
+          }
+        });
+      });
+      examAverages[exam] = count > 0 ? Math.round(total / count) : 0;
+    });
+
+    res.json({
+      success: true,
+      classId,
+      students: Object.values(marksByStudent),
+      subjects: Array.from(subjectSet).sort(),
+      exams: Array.from(examSet).sort(),
+      academicYears: Array.from(academicYears).sort(),
+      subjectAverages,
+      examAverages,
+      total: Object.values(marksByStudent).length,
+    });
+  } catch (err) {
+    console.error('[teacher/class-comprehensive]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/teacher-notifications', async (req, res) => {
   try {
     const roleId = req.query.roleId || req.roleId;
@@ -3089,9 +3478,8 @@ app.get('/api/teacher-calendar', async (req, res) => {
 
 function normalizeExamType(type) {
   const map = {
-    'unit 1': 'unit1', 'unit1': 'unit1',
-    'unit 2': 'unit2', 'unit2': 'unit2',
-    'unit 3': 'unit3', 'unit3': 'unit3',
+    'fa1': 'FA1', 'fa2': 'FA2', 'fa3': 'FA3', 'fa4': 'FA4',
+    'sa1': 'SA1', 'sa2': 'SA2',
   };
   return map[(type || '').toLowerCase().trim()] || type;
 }
@@ -3553,10 +3941,7 @@ app.get('/api/marks/view', async (req, res) => {
     }
 
     const marksRef = db.collection('student_marks');
-    // Query for both normalized and original exam type formats (e.g. 'unit1' and 'Unit 1')
     const examVariants = new Set([examType]);
-    const reverseMap = { 'unit1': 'Unit 1', 'unit2': 'Unit 2', 'unit3': 'Unit 3', 'Unit 1': 'unit1', 'Unit 2': 'unit2', 'Unit 3': 'unit3' };
-    if (reverseMap[examType]) examVariants.add(reverseMap[examType]);
 
     const allDocs = [];
     const seenIds = new Set();
@@ -4182,6 +4567,7 @@ app.get('/api/onboarded-users', async (req, res) => {
         full_name: data.full_name,
         role: data.role,
         role_id: data.role_id,
+        subjects: normalizeSubjectIds(data.subjects || data.subject || []),
         subject: data.subject || '',
         email: data.email || '',
         phone: data.phone || '',
@@ -4289,8 +4675,9 @@ app.post('/api/onboard-teacher', async (req, res) => {
     if (req.userRole !== 'principal' && req.userRole !== 'admin') {
       return res.status(403).json({ error: 'Only admin or principal can onboard staff' });
     }
-    const { fullName, role, subject, email, phone, joinDate } = req.body;
-    console.log('Onboard teacher request:', { fullName, role, subject });
+    const { fullName, role, subject, subjects, email, phone, joinDate } = req.body;
+    const subjectIds = normalizeSubjectIds(subjects || subject || []);
+    console.log('Onboard teacher request:', { fullName, role, subjectIds });
 
     if (!fullName || !role) {
       return res.status(400).json({ error: 'Full name and role are required' });
@@ -4304,8 +4691,8 @@ app.post('/api/onboard-teacher', async (req, res) => {
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
     }
-    if (!subject) {
-      return res.status(400).json({ error: 'Subject is required' });
+    if (subjectIds.length === 0) {
+      return res.status(400).json({ error: 'At least one subject is required' });
     }
 
     const year = new Date().getFullYear();
@@ -4354,7 +4741,8 @@ app.post('/api/onboard-teacher', async (req, res) => {
       email: email || '',
       role: role,
       role_id: teacherId,
-      subject: subject || '',
+      subject: subjectIds[0] || '',
+      subjects: subjectIds,
       phone: phone || '',
       status: authCreated ? 'onboarded' : 'pending_registration',
       join_date: joinDate || new Date().toISOString().split('T')[0],
@@ -4367,13 +4755,20 @@ app.post('/api/onboard-teacher', async (req, res) => {
     const docRef = await usersRef.add(userData);
     console.log(`Onboarded ${role}: ${fullName} | ID: ${teacherId} | Firestore doc: ${docRef.id}`);
 
+    await syncTeacherAggregateDoc({
+      schoolId: req.schoolId || DEFAULT_SCHOOL_ID,
+      roleId: teacherId,
+      teacherDocId: docRef.id,
+      subjects: subjectIds,
+    });
+
     let sheetSync = { success: false };
     try {
       sheetSync = await syncUserDirectory({
         teacherId,
         fullName,
         role,
-        subject: subject || '',
+        subject: subjectIds.map(getSubjectLabel).join(', '),
         email: email || '',
         phone: phone || '',
         status: authCreated ? 'Active' : 'Pending Registration',
@@ -4382,7 +4777,7 @@ app.post('/api/onboard-teacher', async (req, res) => {
     } catch (syncErr) {
       console.error('Google Sheets sync (user directory) failed:', syncErr.message);
     }
-    safeSync('syncTeacher', () => syncTeacher({ teacherId, name: fullName, email: email || '', phone: phone || '', subject: subject || '', designation: role, joiningDate: joinDate || new Date().toISOString().split('T')[0], createdAt: new Date().toISOString() }), { teacherId }).catch(() => {});
+    safeSync('syncTeacher', () => syncTeacher({ teacherId, name: fullName, email: email || '', phone: phone || '', subject: subjectIds.map(getSubjectLabel).join(', '), designation: role, joiningDate: joinDate || new Date().toISOString().split('T')[0], createdAt: new Date().toISOString() }), { teacherId }).catch(() => {});
 
     res.status(201).json({
       success: true,
@@ -4393,7 +4788,8 @@ app.post('/api/onboard-teacher', async (req, res) => {
         full_name: fullName,
         role,
         role_id: teacherId,
-        subject: subject || '',
+        subject: subjectIds[0] || '',
+        subjects: subjectIds,
         email: email || '',
         phone: phone || '',
         status: authCreated ? 'onboarded' : 'pending_registration',
@@ -4664,6 +5060,12 @@ app.post('/api/attendance/save', validate([
     const markedBy = records[0]?.markedBy || 'teacher';
     const classId = records[0]?.classId;
     const resolvedClassName = className || records[0]?.className || classId || '';
+    const submissionDocId = `${classId}_${date}`;
+
+    const existingSubmission = await db.collection('attendance_submissions').doc(submissionDocId).get();
+    if (existingSubmission.exists) {
+      return res.status(409).json({ error: `Attendance already submitted for ${resolvedClassName} on ${date}` });
+    }
 
     // ── LEGACY write (attendance_records) — keeps existing UI working ──
     const batch = db.batch();
@@ -4743,7 +5145,6 @@ app.post('/api/attendance/save', validate([
     console.log(`Attendance saved: ${records.length} records | ${presentCount} present, ${absentCount} absent | Date: ${date}`);
 
     const submissionsRef = db.collection('attendance_submissions');
-    const submissionDocId = `${classId}_${date}`;
     await submissionsRef.doc(submissionDocId).set({
       classId,
       className: resolvedClassName,
@@ -4896,14 +5297,27 @@ app.post('/api/attendance/edit', async (req, res) => {
 
     // ── NEW update: class_attendance ──
     try {
-      await db.collection('class_attendance').doc(classId).collection('dates').doc(date).set(
-        {
-          [`students.${studentId}`]: newStatus,
-          lastEditedAt: editedAt,
-          lastEditedBy: teacherName || editedBy || 'teacher',
+      const classAttendanceRef = db.collection('class_attendance').doc(classId).collection('dates').doc(date);
+      const classAttendanceSnap = await classAttendanceRef.get();
+      const classAttendanceData = classAttendanceSnap.exists ? (classAttendanceSnap.data() || {}) : {};
+      const existingStudents = classAttendanceData.students || {};
+      const cleanupFieldName = `students.${studentId}`;
+      await classAttendanceRef.update(
+        new admin.firestore.FieldPath(cleanupFieldName),
+        admin.firestore.FieldValue.delete()
+      ).catch(() => null);
+      await classAttendanceRef.update(
+        new admin.firestore.FieldPath('students', String(studentId)),
+        admin.firestore.FieldValue.delete()
+      ).catch(() => null);
+      await classAttendanceRef.set({
+        students: {
+          ...existingStudents,
+          [studentId]: newStatus,
         },
-        { merge: true }
-      );
+        lastEditedAt: editedAt,
+        lastEditedBy: teacherName || editedBy || 'teacher',
+      }, { merge: true });
       console.log(`[class_attendance] Edit synced: class ${classId} date ${date} student ${studentId} → ${newStatus}`);
     } catch (classEditErr) {
       console.error('[class_attendance] Edit sync failed (non-blocking):', classEditErr.message);
@@ -7611,10 +8025,12 @@ app.post('/api/student-files/upload', upload.single('file'), async (req, res) =>
   }
 });
 
-app.get('/api/student-files', async (req, res) => {
+app.get('/api/student-files', verifyAuth, async (req, res) => {
   try {
     const { studentId } = req.query;
     if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    const access = await ensureParentOwnsStudent(req, studentId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
     const q = db.collection('student_files').where('studentId', '==', studentId);
     const snap = await q.get();
     const files = snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -7733,14 +8149,47 @@ app.post('/api/student-files/send', verifyAuth, async (req, res) => {
 });
 
 async function lookupStudentById(studentId) {
-  const studentsQ = db.collection('students').where('studentId', '==', studentId);
+  const sid = String(studentId || '').trim();
+  if (!sid) return null;
+
+  const byDocSnap = await db.collection('students').doc(sid).get();
+  if (byDocSnap.exists) {
+    return { id: byDocSnap.id, ...byDocSnap.data() };
+  }
+
+  const studentsQ = db.collection('students').where('studentId', '==', sid).limit(1);
   const snap = await studentsQ.get();
-  return snap.empty ? null : snap.docs[0].data();
+  return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
 }
 async function getParentAccount(uid) {
   const ref = db.collection('parent_accounts').doc(uid);
   const snap = await ref.get();
   return snap.exists ? { id: snap.id, ...snap.data() } : null;
+}
+async function getParentAuthorizedStudentKeys(parentAccount) {
+  const keys = new Set((parentAccount?.studentIds || []).map(id => String(id || '').trim()).filter(Boolean));
+  for (const rawId of parentAccount?.studentIds || []) {
+    const student = await lookupStudentById(rawId);
+    if (!student) continue;
+    if (student.id) keys.add(String(student.id));
+    if (student.studentId) keys.add(String(student.studentId));
+  }
+  return keys;
+}
+async function ensureParentOwnsStudent(req, studentId) {
+  if (req.userRole !== 'parent') return { ok: true };
+
+  const parentAccount = await getParentAccount(req.userId);
+  if (!parentAccount) {
+    return { ok: false, status: 404, error: 'Parent account not found' };
+  }
+
+  const allowedStudentIds = await getParentAuthorizedStudentKeys(parentAccount);
+  if (!allowedStudentIds.has(String(studentId || '').trim())) {
+    return { ok: false, status: 403, error: 'You are not authorized to access this student' };
+  }
+
+  return { ok: true, parentAccount };
 }
 async function buildParentSession(parentAccount, schoolId) {
   const studentIds = parentAccount.studentIds || [];
@@ -7770,10 +8219,12 @@ async function buildParentSession(parentAccount, schoolId) {
   };
 }
 
-app.get('/api/student/bus-tracking', async (req, res) => {
+app.get('/api/student/bus-tracking', verifyAuth, async (req, res) => {
   try {
     const { studentId } = req.query;
     if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    const access = await ensureParentOwnsStudent(req, studentId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
 
     let studentData = {};
     let busRoute = '';
@@ -7993,6 +8444,7 @@ app.post('/api/parent/email-login', loginLimiter, async (req, res) => {
         pinHash: null,
         createdAt: userData.created_at || new Date().toISOString(),
         lastLogin: null,
+        schoolId: userData.schoolId || req.schoolId || DEFAULT_SCHOOL_ID,
       };
       const paRef = await db.collection('parent_accounts').add(paData);
       parentDoc = { id: paRef.id, data: () => paData };
@@ -8001,6 +8453,11 @@ app.post('/api/parent/email-login', loginLimiter, async (req, res) => {
     } else {
       parentDoc = accountSnap.docs[0];
       parentAccount = { id: parentDoc.id, ...parentDoc.data() };
+      const resolvedSchoolId = parentAccount.schoolId || req.schoolId || DEFAULT_SCHOOL_ID;
+      if (parentAccount.schoolId !== resolvedSchoolId) {
+        await db.collection('parent_accounts').doc(parentDoc.id).update({ schoolId: resolvedSchoolId });
+        parentAccount.schoolId = resolvedSchoolId;
+      }
     }
     if (parentAccount.accountStatus === 'disabled') return res.status(403).json({ error: 'Your account has been disabled. Please contact the school admin.' });
     if (parentAccount.lockUntil) {
@@ -8143,10 +8600,12 @@ app.post('/api/admin/parent-accounts/:uid/status', async (req, res) => {
   }
 });
 
-app.get('/api/attendance/student-monthly', async (req, res) => {
+app.get('/api/attendance/student-monthly', verifyAuth, async (req, res) => {
   try {
     const { studentId, month } = req.query;
     if (!studentId || !month) return res.status(400).json({ error: 'studentId and month required' });
+    const access = await ensureParentOwnsStudent(req, studentId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
 
     const [year, mon] = month.split('-').map(Number);
     const daysInMonth = new Date(year, mon, 0).getDate();
@@ -8209,10 +8668,12 @@ app.get('/api/attendance/student-monthly', async (req, res) => {
   }
 });
 
-app.get('/api/parent-notifications', async (req, res) => {
+app.get('/api/parent-notifications', verifyAuth, async (req, res) => {
   try {
     const { studentId } = req.query;
     if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    const access = await ensureParentOwnsStudent(req, studentId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
     const [snap1, snap2] = await Promise.all([
       db.collection('parent_notifications').where('studentId', '==', studentId).get(),
       db.collection('parent_notifications').where('schoolId', '==', (req.schoolId || DEFAULT_SCHOOL_ID)).where('forAll', '==', true).get(),
@@ -8230,7 +8691,7 @@ app.get('/api/parent-notifications', async (req, res) => {
   }
 });
 
-app.post('/api/parent-notifications/read', async (req, res) => {
+app.post('/api/parent-notifications/read', verifyAuth, async (req, res) => {
   try {
     const { notificationIds } = req.body;
     if (!notificationIds || !Array.isArray(notificationIds)) return res.status(400).json({ error: 'notificationIds array required' });
@@ -8482,7 +8943,7 @@ app.post('/api/holiday/sudden', verifyAuth, async (req, res) => {
   }
 });
 
-const { generateReport } = require('./src/report/generateReport');
+const { generateReport } = require('../src/report/generateReport');
 
 app.get('/api/report/master-audit', verifyAuth, (req, res) => {
   if (req.userRole !== 'principal' && req.userRole !== 'admin') {
@@ -9097,395 +9558,7 @@ app.get('/api/report', (req, res) => {
   }
 });
 
-// ════════════════════════════════════════
-// SUPER ADMIN — SCHOOL MANAGEMENT
-// ════════════════════════════════════════
 
-app.post('/api/super/schools/create', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const {
-      schoolName, location, address, phone, email,
-      principalName, principalEmail, principalPhone, principalPassword,
-      board, subscriptionPlan,
-      district, state, tagline, primaryColor, logoUrl, whatsappConfig
-    } = req.body;
-    if (!schoolName || !location || !principalEmail || !principalPassword) {
-      return res.status(400).json({ error: 'schoolName, location, principalEmail, principalPassword are required' });
-    }
-
-    let schoolId = generateSchoolCode(schoolName, location);
-    const existing = await adminDb.collection('schools').where('schoolId', '==', schoolId).get();
-    if (!existing.empty) schoolId = `${schoolId}${Date.now().toString().slice(-3)}`;
-
-    const now = new Date().toISOString();
-
-    await adminDb.collection('schools').doc(schoolId).set({
-      // Core identifiers (all naming conventions)
-      schoolId,
-      school_code: schoolId,
-      school_id:   schoolId,
-      schoolName,
-      name: schoolName,
-      // Location (all naming conventions)
-      location,
-      village:  location,
-      city:     location,
-      district: district || '',
-      state:    state || '',
-      // Contact
-      address:  address || '',
-      phone:    phone || '',
-      email:    email || '',
-      // Principal / Admin (both naming conventions)
-      principalName:  principalName || '',
-      principalEmail: principalEmail,
-      principalPhone: principalPhone || '',
-      adminName:      principalName || '',
-      adminEmail:     principalEmail,
-      adminPhone:     principalPhone || '',
-      // Settings
-      board:              board || 'State Board',
-      subscriptionPlan:   subscriptionPlan || 'basic',
-      subscriptionStatus: 'active',
-      status:             'active',
-      primaryColor:       primaryColor || '#0D1B2A',
-      tagline:            tagline || `Excellence in Education · ${location}`,
-      logoUrl:            logoUrl || '',
-      ...(whatsappConfig ? { whatsappConfig } : {}),
-      studentCount: 0,
-      staffCount:   0,
-      createdAt:    now,
-      updatedAt:    now
-    });
-
-    await adminDb.collection('settings').doc(schoolId).set({
-      schoolId, schoolName, location,
-      district: district || '',
-      state: state || '',
-      tagline: tagline || `Excellence in Education · ${location}`,
-      principalName: principalName || '',
-      principalPhone: principalPhone || '',
-      phone: phone || '',
-      email: email || '',
-      address: address || '',
-      board: board || 'State Board',
-      primaryColor: primaryColor || '#0D1B2A',
-      logoUrl: logoUrl || '',
-      createdAt: now
-    });
-
-    let principalUid = null;
-    if (adminAuth) {
-      try {
-        const userRecord = await adminAuth.createUser({
-          email: principalEmail,
-          password: principalPassword,
-          displayName: principalName || `${schoolName} Principal`
-        });
-        principalUid = userRecord.uid;
-        await adminAuth.setCustomUserClaims(principalUid, { role: 'principal', schoolId, schoolName });
-        await adminDb.collection('admins').doc(principalUid).set({
-          uid: principalUid, email: principalEmail,
-          full_name: principalName || '', role: 'principal',
-          role_id: `PRIN-${schoolId}`,
-          phone: principalPhone || '',
-          schoolId, schoolName, createdAt: now
-        });
-        await adminDb.collection('users').doc(principalUid).set({
-          uid: principalUid, email: principalEmail,
-          name: principalName || '', role: 'principal',
-          phone: principalPhone || '',
-          schoolId, schoolName, createdAt: now
-        });
-      } catch (authErr) {
-        console.error('[Create School] Auth error:', authErr.message);
-      }
-    }
-
-    const schoolQR = JSON.stringify({
-      type:         'school',
-      schoolId,
-      schoolName,
-      location:     location || '',
-      logoUrl:      logoUrl || '',
-      primaryColor: primaryColor || '#1a3c5e',
-      tagline:      tagline || 'Excellence in Education',
-    });
-    await adminDb.collection('schools').doc(schoolId).update({ schoolQR });
-
-    res.json({ success: true, schoolId, schoolName, principalEmail, principalUid, schoolQR, message: `School created: ${schoolId}` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/super/schools', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const snap = await adminDb.collection('schools').get();
-    const schools = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    schools.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-    res.json({ success: true, schools, total: schools.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/super/schools/:schoolId', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const schoolSnap = await adminDb.collection('schools').doc(schoolId).get();
-    if (!schoolSnap.exists) return res.status(404).json({ error: 'School not found' });
-    const [studentsSnap, usersSnap] = await Promise.all([
-      adminDb.collection('students').where('schoolId', '==', schoolId).get(),
-      adminDb.collection('users').where('schoolId', '==', schoolId).get()
-    ]);
-    res.json({
-      success: true,
-      school: { id: schoolSnap.id, ...schoolSnap.data() },
-      stats: { studentCount: studentsSnap.size, staffCount: usersSnap.size }
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/super/schools/:schoolId/status', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const { status } = req.body;
-    if (!['active', 'suspended'].includes(status)) return res.status(400).json({ error: 'status must be active or suspended' });
-    await adminDb.collection('schools').doc(schoolId).update({ status, updatedAt: new Date().toISOString() });
-    res.json({ success: true, schoolId, status });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── SUPER ADMIN: Reset School Admin Password ──────────────────────────────
-app.post('/api/super/schools/:schoolId/reset-password', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-
-    // 1. Get the school document to find the admin email
-    const schoolSnap = await adminDb.collection('schools').doc(schoolId).get();
-    if (!schoolSnap.exists) return res.status(404).json({ error: 'School not found' });
-
-    const schoolData = schoolSnap.data();
-    const adminEmail = schoolData.adminEmail || schoolData.principalEmail;
-    const schoolName = schoolData.schoolName || schoolData.name || schoolId;
-
-    if (!adminEmail) {
-      return res.status(400).json({ error: 'No admin email found for this school. Please update the school details first.' });
-    }
-
-    // 2. Generate a secure temporary password
-    const chars   = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
-    const special = '@#$!';
-    let tempPassword = 'VL@';
-    for (let i = 0; i < 6; i++) tempPassword += chars[Math.floor(Math.random() * chars.length)];
-    tempPassword += special[Math.floor(Math.random() * special.length)];
-    tempPassword += Math.floor(10 + Math.random() * 90);
-
-    // 3. Find the Firebase Auth user by email and update password
-    let userRecord;
-    try {
-      userRecord = await adminAuth.getUserByEmail(adminEmail);
-    } catch (authErr) {
-      return res.status(404).json({ error: `No Firebase Auth account found for ${adminEmail}. The admin may not have logged in yet.` });
-    }
-
-    await adminAuth.updateUser(userRecord.uid, { password: tempPassword });
-
-    // 4. Set mustChangePassword flag in Firestore so app forces password change on next login
-    const now = new Date().toISOString();
-    await adminDb.collection('schools').doc(schoolId).update({
-      mustChangePassword: true,
-      passwordResetAt:    now,
-      updatedAt:          now,
-    });
-
-    // 5. Also update users/admins collection if exists
-    try {
-      await adminDb.collection('users').doc(userRecord.uid).update({ mustChangePassword: true, passwordResetAt: now });
-    } catch (_) {}
-    try {
-      await adminDb.collection('admins').doc(userRecord.uid).update({ mustChangePassword: true, passwordResetAt: now });
-    } catch (_) {}
-
-    // 6. Log this action in a security_logs subcollection
-    await adminDb.collection('schools').doc(schoolId).collection('security_logs').add({
-      action:     'password_reset',
-      performedBy:'super_admin',
-      targetEmail: adminEmail,
-      timestamp:   now,
-      note:        'Password reset by Super Admin via dashboard',
-    });
-
-    console.log(`[Password Reset] ${schoolId} (${adminEmail}) reset at ${now}`);
-
-    res.json({
-      success:       true,
-      schoolId,
-      schoolName,
-      adminEmail,
-      tempPassword,
-      message:       `Password reset for ${adminEmail}. They must change it on next login.`,
-      resetAt:       now,
-    });
-  } catch (err) {
-    console.error('[Password Reset] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/super/schools/:schoolId/subscription', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const { subscriptionPlan, subscriptionStatus, expiresAt } = req.body;
-    await adminDb.collection('schools').doc(schoolId).update({
-      subscriptionPlan: subscriptionPlan || 'basic',
-      subscriptionStatus: subscriptionStatus || 'active',
-      expiresAt: expiresAt || null,
-      updatedAt: new Date().toISOString()
-    });
-    res.json({ success: true, schoolId, subscriptionPlan, subscriptionStatus });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/super/stats', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const schoolsSnap = await adminDb.collection('schools').get();
-    const schools = schoolsSnap.docs.map(d => d.data());
-    const [studentsSnap, usersSnap] = await Promise.all([
-      adminDb.collection('students').get(),
-      adminDb.collection('users').get()
-    ]);
-    res.json({
-      success: true,
-      stats: {
-        totalSchools: schools.length,
-        activeSchools: schools.filter(s => s.status === 'active').length,
-        suspendedSchools: schools.filter(s => s.status === 'suspended').length,
-        totalStudents: studentsSnap.size,
-        totalStaff: usersSnap.size
-      },
-      schools: schools.map(s => ({
-        schoolId: s.schoolId, schoolName: s.schoolName, location: s.location,
-        status: s.status, subscriptionPlan: s.subscriptionPlan,
-        subscriptionStatus: s.subscriptionStatus, createdAt: s.createdAt
-      }))
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/super/schools/:schoolId/activity', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const { limit: limitCount = 20 } = req.query;
-
-    const [studentsSnap, staffSnap, tripsSnap, scansSnap] = await Promise.all([
-      adminDb.collection('students').where('schoolId', '==', schoolId)
-        .orderBy('createdAt', 'desc').limit(5).get(),
-      adminDb.collection('users').where('schoolId', '==', schoolId)
-        .orderBy('created_at', 'desc').limit(5).get(),
-      adminDb.collection('bus_trips').where('schoolId', '==', schoolId)
-        .orderBy('startTime', 'desc').limit(5).get(),
-      adminDb.collection('trip_scans').where('schoolId', '==', schoolId)
-        .orderBy('timestamp', 'desc').limit(5).get()
-    ]);
-
-    const activity = [
-      ...studentsSnap.docs.map(d => ({ type: 'student_added', name: d.data().name, time: d.data().createdAt })),
-      ...staffSnap.docs.map(d => ({ type: 'staff_added', name: d.data().full_name, role: d.data().role, time: d.data().created_at })),
-      ...tripsSnap.docs.map(d => ({ type: 'trip', tripType: d.data().tripType, status: d.data().status, time: d.data().startTime })),
-      ...scansSnap.docs.map(d => ({ type: 'scan', studentName: d.data().studentName, scanType: d.data().type, time: d.data().timestamp }))
-    ].sort((a, b) => (b.time || '').localeCompare(a.time || '')).slice(0, parseInt(limitCount));
-
-    res.json({ success: true, schoolId, activity });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/super/schools/:schoolId/summary', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-
-    const schoolSnap = await adminDb.collection('schools').doc(schoolId).get();
-    if (!schoolSnap.exists) return res.status(404).json({ error: 'School not found' });
-
-    const [
-      studentsSnap, usersSnap, classesSnap,
-      tripsSnap, scansSnap, leavesSnap
-    ] = await Promise.all([
-      adminDb.collection('students').where('schoolId', '==', schoolId).get(),
-      adminDb.collection('users').where('schoolId', '==', schoolId).get(),
-      adminDb.collection('classes').where('schoolId', '==', schoolId).get(),
-      adminDb.collection('bus_trips').where('schoolId', '==', schoolId).get(),
-      adminDb.collection('trip_scans').where('schoolId', '==', schoolId).get(),
-      adminDb.collection('leaveRequests').where('schoolId', '==', schoolId).get()
-    ]);
-
-    const staff = usersSnap.docs.map(d => d.data());
-
-    res.json({
-      success: true,
-      school: { id: schoolSnap.id, ...schoolSnap.data() },
-      stats: {
-        totalStudents: studentsSnap.size,
-        totalStaff: usersSnap.size,
-        totalClasses: classesSnap.size,
-        totalTrips: tripsSnap.size,
-        totalScans: scansSnap.size,
-        pendingLeaves: leavesSnap.docs.filter(d => d.data().status === 'Pending').length,
-        byRole: {
-          teachers: staff.filter(u => u.role === 'teacher').length,
-          drivers: staff.filter(u => u.role === 'driver').length,
-          cleaners: staff.filter(u => u.role === 'cleaner').length,
-          principal: staff.filter(u => u.role === 'principal').length
-        }
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/super/schools/:schoolId', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const { confirm } = req.body;
-    if (confirm !== `DELETE_${schoolId}`) {
-      return res.status(400).json({ error: `Send confirm: DELETE_${schoolId} to proceed` });
-    }
-
-    await adminDb.collection('schools').doc(schoolId).delete();
-    await adminDb.collection('settings').doc(schoolId).delete().catch(() => {});
-
-    res.json({ success: true, message: `School ${schoolId} deleted. Data remains in collections with schoolId tag.` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/super/schools/:schoolId/security-logs', superAdminLimiter, verifySuperAdmin, async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const snap = await adminDb.collection('scan_rejection_logs')
-      .where('schoolId', '==', schoolId)
-      .orderBy('timestamp', 'desc')
-      .limit(50)
-      .get();
-    const logs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json({ success: true, logs, total: logs.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -10382,6 +10455,8 @@ app.get('/api/parent/fee-summary', verifyAuth, async (req, res) => {
   try {
     const { studentId } = req.query;
     if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    const access = await ensureParentOwnsStudent(req, studentId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
     const schoolId = req.schoolId || DEFAULT_SCHOOL_ID;
 
     const feeQ = db.collection('fee_records').where('studentId', '==', studentId).where('schoolId', '==', schoolId);

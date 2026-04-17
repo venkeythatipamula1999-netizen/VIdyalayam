@@ -128,7 +128,7 @@ async function run() {
 
   // ── 9. MARKS / CCE ────────────────────────────────────────
   console.log('\n── MARKS & CCE ──');
-  const marksClass = await req('GET', `/api/marks/class/10-A?schoolId=${SCHOOL}&examType=unit1&academicYear=2025-26`, null, token);
+  const marksClass = await req('GET', `/api/marks/class/10-A?schoolId=${SCHOOL}&examType=FA1&academicYear=2025-26`, null, token);
   pass('Marks by class', marksClass.status === 200, JSON.stringify(marksClass.body).slice(0, 80));
 
   // ── 10. PROMOTION ─────────────────────────────────────────

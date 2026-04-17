@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Modal, Platform, ActivityIndicator, BackHandler } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Modal, Platform, ActivityIndicator, BackHandler, SafeAreaView } from 'react-native';
 import { C } from '../../theme/colors';
 import Icon from '../../components/Icon';
 import { LinearGradient } from 'expo-linear-gradient';
 import { getFriendlyError } from '../../utils/errorMessages';
 import { apiFetch } from '../../api/client';
+import { SUBJECTS, getSubjectLabel } from '../../constants/subjects';
 
 export default function AdminUsers({ onBack, onNavigate }) {
   const [tab, setTab] = useState('teachers');
@@ -22,7 +23,7 @@ export default function AdminUsers({ onBack, onNavigate }) {
   const [onboardError, setOnboardError] = useState('');
   const [copied, setCopied] = useState(false);
   const [newName, setNewName] = useState('');
-  const [newSubj, setNewSubj] = useState('');
+  const [selectedSubjects, setSelectedSubjects] = useState([]);
   const [newRole, setNewRole] = useState('teacher');
   const [newEmail, setNewEmail] = useState('');
   const [newPhone, setNewPhone] = useState('');
@@ -40,7 +41,6 @@ export default function AdminUsers({ onBack, onNavigate }) {
   const [pickerMonth, setPickerMonth] = useState(today.getMonth());
   const [pickerYear, setPickerYear] = useState(today.getFullYear());
 
-  const SUBJECTS = ['Telugu', 'Hindi', 'English', 'Mathematics', 'Science (Physics)', 'Science (Biology)', 'Social Studies', 'Computer', 'Physical Education'];
   const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
   const formatDisplayDate = (iso) => {
@@ -421,22 +421,41 @@ export default function AdminUsers({ onBack, onNavigate }) {
     }
   };
 
+  const toggleSubject = (subjectId) => {
+    setSelectedSubjects((prev) =>
+      prev.includes(subjectId)
+        ? prev.filter((item) => item !== subjectId)
+        : [...prev, subjectId]
+    );
+  };
+
+  const removeSubject = (subjectId) => {
+    setSelectedSubjects((prev) => prev.filter((item) => item !== subjectId));
+  };
+
   const handleOnboard = async () => {
     if (!newName.trim()) { setOnboardError('Please provide Full Name to continue.'); return; }
     if (!newPhone.trim() || !/^[6-9]\d{9}$/.test(newPhone.replace(/\s/g, ''))) { setOnboardError('Please provide Mobile Number to continue.'); return; }
     if (!newEmail.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail.trim())) { setOnboardError('Please provide Email to continue.'); return; }
-    if (!newSubj.trim()) { setOnboardError('Please provide Subject to continue.'); return; }
+    if (selectedSubjects.length === 0) { setOnboardError('Please select at least one subject to continue.'); return; }
     setOnboarding(true);
     setOnboardError('');
     try {
       const resp = await apiFetch('/onboard-teacher', {
         method: 'POST',
-        body: JSON.stringify({ fullName: newName.trim(), role: newRole, subject: newSubj.trim(), email: newEmail.trim(), phone: newPhone.replace(/\s/g, ''), joinDate: newJoinDate }),
+        body: JSON.stringify({
+          fullName: newName.trim(),
+          role: newRole,
+          subjects: selectedSubjects,
+          email: newEmail.trim(),
+          phone: newPhone.replace(/\s/g, ''),
+          joinDate: newJoinDate,
+        }),
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'Onboarding failed');
       setOnboardResult(data);
-      setNewName(''); setNewSubj(''); setNewEmail(''); setNewPhone(''); setNewRole('teacher'); setNewJoinDate(new Date().toISOString().split('T')[0]);
+      setNewName(''); setSelectedSubjects([]); setNewEmail(''); setNewPhone(''); setNewRole('teacher'); setNewJoinDate(new Date().toISOString().split('T')[0]);
       setShowForm(false);
       fetchOnboardedUsers();
     } catch (err) {
@@ -525,7 +544,8 @@ export default function AdminUsers({ onBack, onNavigate }) {
               {isTeacher ? 'Teacher' : isDriver ? 'Driver' : 'Cleaner'} Profile
             </Text>
             <Text style={{ color: C.muted, fontSize: 12 }}>{roleId}</Text>
-          </View>
+                          ))}
+                        </View>
         </View>
         <View style={{ paddingHorizontal: 20, paddingBottom: 20 }}>
           <LinearGradient colors={[accentColor + '22', C.navyMid]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={{ borderWidth: 1, borderColor: accentColor + '44', borderRadius: 22, padding: 20, marginBottom: 18 }}>
@@ -536,7 +556,11 @@ export default function AdminUsers({ onBack, onNavigate }) {
               <View style={{ flex: 1 }}>
                 <Text style={{ fontWeight: '700', fontSize: 19, color: C.white }}>{name}</Text>
                 <Text style={{ color: C.muted, fontSize: 12, marginTop: 3 }}>
-                  {isTeacher ? (u.subject || 'Teacher') : isDriver ? 'Bus Driver' : 'Cleaner / Attender'}
+                  {isTeacher
+                    ? ((u.subjects || []).length
+                      ? u.subjects.map(getSubjectLabel).join(', ')
+                      : (u.subject || 'Teacher'))
+                    : isDriver ? 'Bus Driver' : 'Cleaner / Attender'}
                 </Text>
                 <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
                   <View style={{ paddingVertical: 3, paddingHorizontal: 10, borderRadius: 20, backgroundColor: statusColor + '22', borderWidth: 1, borderColor: statusColor + '44' }}>
@@ -562,7 +586,7 @@ export default function AdminUsers({ onBack, onNavigate }) {
               ['\uD83D\uDCDE', 'Emergency Contact', u.emergency_contact || '—'],
               ['\uD83C\uDF82', 'Date of Birth', u.date_of_birth || '—'],
               ['\uD83D\uDCC5', 'Date of Joining', u.join_date || u.joined_date || '—'],
-              ...(isTeacher ? [['\uD83D\uDCDA', 'Subject', u.subject || '—']] : []),
+              ...(isTeacher ? [['\uD83D\uDCDA', 'Subjects', (u.subjects || []).length ? u.subjects.map(getSubjectLabel).join(', ') : (u.subject || '—')]] : []),
               ...(isDriver ? [
                 ['\uD83D\uDE8C', 'Bus Number', u.bus_number || '—'],
                 ['\uD83D\uDDFA\uFE0F', 'Route', u.route || '—'],
@@ -1003,11 +1027,25 @@ export default function AdminUsers({ onBack, onNavigate }) {
                     <TextInput style={st.input} placeholder="e.g. 9876543210" placeholderTextColor={C.muted} value={newPhone} onChangeText={(t) => setNewPhone(t.replace(/[^0-9]/g, '').slice(0, 10))} keyboardType="phone-pad" maxLength={10} />
                     <Text style={[st.label, { marginTop: 10 }]}>Email *</Text>
                     <TextInput style={st.input} placeholder="e.g. teacher@venkeys.edu" placeholderTextColor={C.muted} value={newEmail} onChangeText={setNewEmail} keyboardType="email-address" autoCapitalize="none" />
-                    <Text style={[st.label, { marginTop: 10 }]}>Assigned Subject *</Text>
-                    <TouchableOpacity onPress={() => setShowSubjectPicker(true)} style={[st.input, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }]}>
-                      <Text style={{ color: newSubj ? C.white : C.muted, fontSize: 14 }}>{newSubj || 'Select Subject'}</Text>
+                    <Text style={[st.label, { marginTop: 10 }]}>Assigned Subjects *</Text>
+                    <TouchableOpacity onPress={() => setShowSubjectPicker(true)} style={[st.input, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: C.cardAlt || '#1a2f4a', borderRadius: 10, borderWidth: 1, borderColor: C.border }]}>
+                      <Text style={{ color: selectedSubjects.length ? C.white : C.muted, fontSize: 14 }}>
+                        {selectedSubjects.length ? `${selectedSubjects.length} subject(s) selected` : 'Select Subjects'}
+                      </Text>
                       <Text style={{ color: C.muted, fontSize: 12 }}>▾</Text>
                     </TouchableOpacity>
+                    {selectedSubjects.length > 0 ? (
+                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+                        {selectedSubjects.map((subjectId) => (
+                          <View key={subjectId} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: C.gold + '22', borderWidth: 1, borderColor: C.gold, borderRadius: 20, paddingVertical: 4, paddingHorizontal: 12 }}>
+                            <Text style={{ color: C.white, fontSize: 12, fontWeight: '600' }}>{getSubjectLabel(subjectId)}</Text>
+                            <TouchableOpacity onPress={() => removeSubject(subjectId)}>
+                              <Text style={{ color: C.gold, fontSize: 12, fontWeight: '700' }}>✕</Text>
+                            </TouchableOpacity>
+                          </View>
+                        ))}
+                      </View>
+                    ) : null}
                     <Text style={[st.label, { marginTop: 10 }]}>Date of Joining *</Text>
                     <TouchableOpacity
                       onPress={() => {
@@ -1027,10 +1065,10 @@ export default function AdminUsers({ onBack, onNavigate }) {
                       </View>
                     ) : null}
                     <View style={{ flexDirection: 'row', gap: 8, marginTop: 14 }}>
-                      <TouchableOpacity onPress={() => { setShowForm(false); setOnboardError(''); }} style={{ flex: 1, backgroundColor: C.navyMid, borderWidth: 1, borderColor: C.border, borderRadius: 12, padding: 10, alignItems: 'center' }}>
+                      <TouchableOpacity onPress={() => { setShowForm(false); setOnboardError(''); setSelectedSubjects([]); }} style={{ flex: 1, backgroundColor: C.navyMid, borderWidth: 1, borderColor: C.border, borderRadius: 12, padding: 10, alignItems: 'center' }}>
                         <Text style={{ color: C.muted, fontWeight: '700' }}>Cancel</Text>
                       </TouchableOpacity>
-                      <TouchableOpacity onPress={handleOnboard} disabled={onboarding || !newSubj.trim()} style={{ flex: 1, backgroundColor: C.teal, borderRadius: 12, padding: 10, alignItems: 'center', opacity: (onboarding || !newSubj.trim()) ? 0.5 : 1 }}>
+                      <TouchableOpacity onPress={handleOnboard} disabled={onboarding || selectedSubjects.length === 0} style={{ flex: 1, backgroundColor: C.teal, borderRadius: 12, padding: 10, alignItems: 'center', opacity: (onboarding || selectedSubjects.length === 0) ? 0.5 : 1 }}>
                         {onboarding ? <ActivityIndicator size="small" color={C.navy} /> : <Text style={{ color: C.navy, fontWeight: '700' }}>Generate & Onboard</Text>}
                       </TouchableOpacity>
                     </View>
@@ -1236,21 +1274,27 @@ export default function AdminUsers({ onBack, onNavigate }) {
         <TouchableOpacity style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'flex-end' }} activeOpacity={1} onPress={() => setShowSubjectPicker(false)}>
           <View style={{ backgroundColor: C.card, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingBottom: 30 }}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 18, borderBottomWidth: 1, borderBottomColor: C.border }}>
-              <Text style={{ fontWeight: '700', fontSize: 16, color: C.white }}>Select Subject</Text>
+              <Text style={{ fontWeight: '700', fontSize: 16, color: C.white }}>Select Subjects</Text>
               <TouchableOpacity onPress={() => setShowSubjectPicker(false)}>
                 <Text style={{ color: C.muted, fontSize: 14 }}>✕</Text>
               </TouchableOpacity>
             </View>
-            {SUBJECTS.map((subj) => (
-              <TouchableOpacity
-                key={subj}
-                onPress={() => { setNewSubj(subj); setShowSubjectPicker(false); }}
-                style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14, paddingHorizontal: 20, borderBottomWidth: 1, borderBottomColor: C.border + '55' }}
-              >
-                <Text style={{ fontSize: 15, color: newSubj === subj ? C.teal : C.white, fontWeight: newSubj === subj ? '700' : '400' }}>{subj}</Text>
-                {newSubj === subj && <Text style={{ color: C.teal, fontSize: 16 }}>✓</Text>}
-              </TouchableOpacity>
-            ))}
+            {SUBJECTS.map((subj) => {
+              const isSelected = selectedSubjects.includes(subj.id);
+              return (
+                <TouchableOpacity
+                  key={subj.id}
+                  onPress={() => toggleSubject(subj.id)}
+                  style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', minHeight: 48, paddingVertical: 14, paddingHorizontal: 20, borderBottomWidth: 1, borderBottomColor: C.border + '55' }}
+                >
+                <Text style={{ fontSize: 15, color: isSelected ? C.teal : C.white, fontWeight: isSelected ? '700' : '400' }}>{subj.label}</Text>
+                {isSelected && <Text style={{ color: C.teal, fontSize: 16 }}>✓</Text>}
+                </TouchableOpacity>
+              );
+            })}
+            <TouchableOpacity onPress={() => setShowSubjectPicker(false)} style={{ marginHorizontal: 20, marginTop: 18, backgroundColor: C.teal, borderRadius: 12, paddingVertical: 12, alignItems: 'center' }}>
+              <Text style={{ color: C.navy, fontWeight: '700' }}>Done</Text>
+            </TouchableOpacity>
           </View>
         </TouchableOpacity>
       </Modal>

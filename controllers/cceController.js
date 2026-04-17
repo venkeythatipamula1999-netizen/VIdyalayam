@@ -316,6 +316,15 @@ async function getMarks(req, res) {
       return res.status(400).json({ error: 'academicYear, classId, subjectId, examType are required' });
     }
 
+    // Authorization: Teachers can only view marks for their assigned subject/class
+    const role = req.userRole || '';
+    if (!ADMIN_ROLES.includes(role)) {
+      const allowed = await checkTeacherAssignment(req, subjectId, classId, section || '', academicYear);
+      if (!allowed) {
+        return res.status(403).json({ error: 'You are not assigned to this subject/class' });
+      }
+    }
+
     const snap = await cceColl(schoolId(req))
       .where('academicYear', '==', academicYear)
       .where('classId',      '==', classId)
@@ -804,6 +813,24 @@ async function getClassMarks(req, res) {
     }
 
     const sid = schoolId(req);
+
+    // Authorization: Teachers can only view class marks for their assigned classes
+    const role = req.userRole || '';
+    if (!ADMIN_ROLES.includes(role)) {
+      const userDoc = await db().collection('users').doc(req.userId || '').get();
+      if (!userDoc.exists) {
+        return res.status(403).json({ error: 'User not found' });
+      }
+      const userData = userDoc.data();
+      const assignedClasses = (userData.assignedClasses || []).map(c => c.trim().toLowerCase());
+      const timetable = userData.timetable || [];
+      const classNorm = classId.replace(/^Grade\s*/i, '').trim().toLowerCase();
+      const hasClassAccess = assignedClasses.some(ac => ac.replace(/^Grade\s*/i, '').trim() === classNorm) ||
+        timetable.some(t => (t.className || '').replace(/^Grade\s*/i, '').trim().toLowerCase() === classNorm);
+      if (!hasClassAccess) {
+        return res.status(403).json({ error: 'You are not assigned to this class' });
+      }
+    }
 
     const [marksSnap, studSnap] = await Promise.all([
       cceColl(sid)

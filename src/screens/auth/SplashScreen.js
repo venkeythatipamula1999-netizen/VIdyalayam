@@ -7,6 +7,7 @@ import {
   Image,
   StyleSheet,
   Platform,
+  Linking,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -56,15 +57,6 @@ export default function SplashScreen({ onSelect }) {
             >
               <Ionicons name="book" size={20} color="#fff" style={styles.btnIcon} />
               <Text style={styles.btnText}>Teacher / Staff Login</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.btn, styles.btnPurple]}
-              onPress={() => onSelect('driver-login')}
-              activeOpacity={0.82}
-            >
-              <Ionicons name="bus" size={20} color="#fff" style={styles.btnIcon} />
-              <Text style={styles.btnText}>Driver / Cleaner Login</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -191,6 +183,9 @@ const styles = StyleSheet.create({
   },
   btnPurple: {
     backgroundColor: '#7C3AED',
+  },
+  btnAdmin: {
+    backgroundColor: '#db2777', // pink/rose colour
   },
   btnOutline: {
     backgroundColor: 'transparent',

@@ -186,7 +186,7 @@ async function run() {
   pass('Submitted exams list', submittedExams.status === 200,
     trunc(submittedExams.body));
 
-  const marksView = await req('GET', `/api/marks/view?classId=6A&subject=${SUBJECT}&examType=unit1`, null, token);
+  const marksView = await req('GET', `/api/marks/view?classId=6A&subject=${SUBJECT}&examType=FA1`, null, token);
   pass('View marks', marksView.status === 200,
     trunc(marksView.body));
 
@@ -205,11 +205,11 @@ async function run() {
   pass('CCE assigned subjects', mySubjects.status === 200,
     trunc(mySubjects.body));
 
-  const cceMarks = await req('GET', `/api/cce/marks?classId=6A&subjectId=Mathematics&examType=unit1&academicYear=${acadYear}`, null, token);
+  const cceMarks = await req('GET', `/api/cce/marks?classId=6A&subjectId=Mathematics&examType=FA1&academicYear=${acadYear}`, null, token);
   pass('CCE get marks', cceMarks.status === 200,
     trunc(cceMarks.body));
 
-  const cceClassMarks = await req('GET', `/api/cce/marks/class?classId=6A&examType=unit1&academicYear=${acadYear}`, null, token);
+  const cceClassMarks = await req('GET', `/api/cce/marks/class?classId=6A&examType=FA1&academicYear=${acadYear}`, null, token);
   pass('CCE class marks', cceClassMarks.status === 200,
     trunc(cceClassMarks.body));
 

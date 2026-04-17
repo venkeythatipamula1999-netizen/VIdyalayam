@@ -25,9 +25,12 @@ const ALL_SUBJECTS = [
 ];
 
 const EXAM_TYPES = [
-  { id: 'unit1', label: 'Unit 1' },
-  { id: 'unit2', label: 'Unit 2' },
-  { id: 'unit3', label: 'Unit 3' },
+  { id: 'FA1', label: 'FA1' },
+  { id: 'FA2', label: 'FA2' },
+  { id: 'FA3', label: 'FA3' },
+  { id: 'FA4', label: 'FA4' },
+  { id: 'SA1', label: 'SA1' },
+  { id: 'SA2', label: 'SA2' },
 ];
 
 const MAX_MARKS = 20;
@@ -284,11 +287,43 @@ export default function TeacherMarksScreen({ onBack, currentUser }) {
     setLoadingView(true);
     setViewData(null);
     try {
-      console.log('STEP 7 - Teacher view: loading marks for classId:', classId);
-      const res = await apiFetch(`/marks/class/${classId}`);
+      console.log('Loading comprehensive marks for classId:', classId);
+      const res = await apiFetch(`/teacher/class-comprehensive/${encodeURIComponent(classId)}`);
       const data = await res.json();
-      console.log('STEP 7 - Teacher view: records =', data.total, ', students =', data.students?.length);
-      if (data.success) setViewData(data);
+      console.log('Comprehensive marks loaded:', data.total, 'students,', data.subjects?.length, 'subjects');
+      if (data.success) {
+        // Transform the data for display
+        const viewDataTransformed = {
+          students: data.students.map(s => ({
+            ...s,
+            overallPct: 0, // Will calculate below
+            byExam: data.exams.map(exam => {
+              const subjectMarks = s.subjectMarks || {};
+              const total = Object.values(subjectMarks).reduce((sum, exams) => {
+                return sum + (exams[exam]?.marks || 0);
+              }, 0);
+              const max = Object.values(subjectMarks).reduce((sum, exams) => {
+                return sum + (exams[exam]?.maxMarks || 0);
+              }, 0);
+              return {
+                examType: exam,
+                total,
+                maxTotal: max,
+                subjects: data.subjects.map(subject => ({
+                  subject,
+                  marks: s.subjectMarks?.[subject]?.[exam]?.marks || null,
+                  maxMarks: s.subjectMarks?.[subject]?.[exam]?.maxMarks || 20,
+                })).filter(sm => sm.marks !== null),
+              };
+            }),
+          })),
+          classAvgBySubject: data.subjects.map(subject => ({
+            subject,
+            pct: data.subjectAverages[subject] || 0,
+          })),
+        };
+        setViewData(viewDataTransformed);
+      }
     } catch (err) {
       console.error('Teacher view marks error:', err);
       setViewData(null);

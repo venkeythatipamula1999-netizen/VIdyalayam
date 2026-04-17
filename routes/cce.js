@@ -4,11 +4,11 @@ const router               = require('express').Router();
 const ctrl                 = require('../controllers/cceController');
 const teacherSubjectGuard  = require('../middleware/teacherSubjectGuard');
 
-router.post('/marks/bulk',                ctrl.saveBulkMarks);
+router.post('/marks/bulk',                teacherSubjectGuard, ctrl.saveBulkMarks);
 router.post('/marks',                     teacherSubjectGuard, ctrl.saveMarks);
 router.put('/marks',                      teacherSubjectGuard, ctrl.editMarks);
-router.get('/marks/class',                ctrl.getClassMarks);
-router.get('/marks',                      ctrl.getMarks);
+router.get('/marks/class',                teacherSubjectGuard, ctrl.getClassMarks);
+router.get('/marks',                      teacherSubjectGuard, ctrl.getMarks);
 router.get('/my-assigned-subjects',       ctrl.getMyAssignedSubjects);
 router.post('/admin/assign-subject',      ctrl.assignTeacherSubject);
 router.delete('/admin/assign-subject',    ctrl.removeTeacherSubject);

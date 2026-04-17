@@ -2,12 +2,20 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { reportError, reportApiError } from '../services/errorReporter';
 
 // Production and Local API URLs
-const PROD_API_URL = 'https://vidyalayam-one.vercel.app/api'; 
-const LOCAL_API_URL = 'http://localhost:5001/api';
+const PROD_API_URL =
+  process.env.EXPO_PUBLIC_API_URL ||
+  ((typeof window !== 'undefined' && window.location?.origin)
+    ? `${window.location.origin}/api`
+    : 'https://vidyalayam-one.vercel.app/api');
+const LOCAL_API_URL = 'http://192.168.1.33:5001/api'; // Mobile testing with local backend
+const LOCALHOST_API_URL = 'http://localhost:5001/api'; // Web testing
 
-const API_BASE = (typeof __DEV__ !== 'undefined' && __DEV__ && typeof window !== 'undefined' && window.location.hostname === 'localhost')
-  ? LOCAL_API_URL
-  : PROD_API_URL;
+// Check if running on localhost (web) or use correct API URL
+const API_BASE = (typeof __DEV__ !== 'undefined' && __DEV__ && typeof window !== 'undefined' && window.location && window.location.hostname === 'localhost')
+  ? LOCALHOST_API_URL
+  : (typeof __DEV__ !== 'undefined' && __DEV__)
+    ? LOCAL_API_URL // React Native/Mobile uses local IP
+    : PROD_API_URL;
 
 
 export async function apiFetch(path, options = {}) {

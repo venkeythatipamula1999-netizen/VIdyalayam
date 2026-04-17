@@ -9,12 +9,13 @@ import { Platform } from 'react-native';
 import { C } from '../../theme/colors';
 
 const PRODUCTION_URL = 'https://vidyalayam-one.vercel.app';
-const LOCAL_API_URL = 'http://localhost:5001';
+const LOCAL_IP_URL = 'http://192.168.1.33:5001'; // Local development IP
+const LOCALHOST_URL = 'http://localhost:5001'; // Web development
 const API_BASE = Platform.OS === 'web'
-  ? (typeof window !== 'undefined' && window.location.hostname !== 'localhost'
-      ? `https://${window.location.hostname}`
-      : LOCAL_API_URL)
-  : PRODUCTION_URL;
+  ? (typeof window !== 'undefined' && window.location && window.location.hostname === 'localhost'
+      ? LOCALHOST_URL
+      : PRODUCTION_URL)
+  : LOCAL_IP_URL; // React Native/Mobile uses local IP
 
 export default function WelcomeScreen({ onNavigate }) {
   const [mode, setMode]               = useState('home');
