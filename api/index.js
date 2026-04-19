@@ -10790,4 +10790,5 @@ app.get('/api/birthdays/today', verifyAuth, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-\nmodule.exports = app;
+
+module.exports = app;
