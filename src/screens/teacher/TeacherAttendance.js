@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, TextInput, ActivityIndicator, Modal, BackHandler, Alert } from 'react-native';
 import { C } from '../../theme/colors';
+import { StudentProfileModal } from './TeacherDashboard';
 import Icon from '../../components/Icon';
 import { apiFetch } from '../../api/client';
 import LoadingSpinner from '../../components/LoadingSpinner';
@@ -119,6 +120,7 @@ export default function TeacherAttendance({ onBack, currentUser }) {
 
   const [editingStudent, setEditingStudent] = useState(null);
   const [savingEdit, setSavingEdit] = useState(null);
+  const [selectedProfileStudent, setSelectedProfileStudent] = useState(null);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => { onBack(); return true; });
@@ -375,6 +377,7 @@ export default function TeacherAttendance({ onBack, currentUser }) {
   if (!isLoading && !isAdmin && !normalizedCT) {
     return (
       <View style={{ flex: 1, backgroundColor: C.navy }}>
+      <StudentProfileModal visible={!!selectedProfileStudent} onClose={() => setSelectedProfileStudent(null)} student={selectedProfileStudent} />
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, paddingTop: 16, paddingBottom: 8, paddingHorizontal: 20 }}>
           <TouchableOpacity onPress={onBack} style={{ width: 38, height: 38, borderRadius: 12, backgroundColor: C.card, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' }}>
             <Icon name="back" size={18} color={C.white} />
@@ -633,32 +636,62 @@ export default function TeacherAttendance({ onBack, currentUser }) {
                         </Text>
                       </View>
                     ) : (
-                      filteredStudents.map((s, idx) => {
-                        const isAbsent = absentSet.has(s.id);
-                        return (
-                          <View key={s.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, borderBottomWidth: idx < filteredStudents.length - 1 ? 1 : 0, borderBottomColor: C.border }}>
-                            <View style={{ width: 38, height: 38, borderRadius: 19, backgroundColor: isAbsent ? C.coral + '33' : C.teal + '33', alignItems: 'center', justifyContent: 'center' }}>
-                              <Text style={{ color: isAbsent ? C.coral : C.teal, fontWeight: '700', fontSize: 14 }}>{(s.name[0] || '?').toUpperCase()}</Text>
-                            </View>
-                            <View style={{ flex: 1 }}>
-                              <Text style={{ fontWeight: '600', fontSize: 14, color: C.white }}>{s.name}</Text>
-                              <Text style={{ color: C.muted, fontSize: 12 }}>{'Roll #'}{s.roll || '–'}</Text>
-                            </View>
-                            <TouchableOpacity
-                              onPress={() => toggleStudent(s.id)}
-                              disabled={!canMarkAttendance}
-                              style={{ flexDirection: 'row', alignItems: 'center', borderRadius: 20, overflow: 'hidden', opacity: canMarkAttendance ? 1 : 0.5 }}
-                            >
-                              <View style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: !isAbsent ? C.teal : C.navyMid, borderTopLeftRadius: 20, borderBottomLeftRadius: 20 }}>
-                                <Text style={{ fontSize: 12, fontWeight: '700', color: !isAbsent ? C.white : C.muted }}>P</Text>
-                              </View>
-                              <View style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: isAbsent ? C.coral : C.navyMid, borderTopRightRadius: 20, borderBottomRightRadius: 20 }}>
-                                <Text style={{ fontSize: 12, fontWeight: '700', color: isAbsent ? C.white : C.muted }}>A</Text>
-                              </View>
-                            </TouchableOpacity>
-                          </View>
-                        );
-                      })
+                      (() => {
+    const presList = [];
+    const absList = [];
+    filteredStudents.forEach(s => {
+      if (absentSet.has(s.id)) absList.push(s);
+      else presList.push(s);
+    });
+    
+    return (
+      <View>
+        {absList.length > 0 && (
+          <View>
+            <Text style={{ fontSize: 12, fontWeight: '700', color: C.coral, marginBottom: 8, marginTop: 8 }}>ABSENT ({absList.length})</Text>
+            {absList.map((s, idx) => (
+              <TouchableOpacity key={s.id} onPress={() => setSelectedProfileStudent({...s, className: classInfo?.grade})} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border }}>
+                <View style={{ width: 38, height: 38, borderRadius: 19, backgroundColor: C.coral + '33', alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={{ color: C.coral, fontWeight: '700', fontSize: 14 }}>{(s.name[0] || '?').toUpperCase()}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontWeight: '600', fontSize: 14, color: C.white }}>{s.name}</Text>
+                  <Text style={{ color: C.muted, fontSize: 12 }}>{'Roll #'}{s.roll || '–'}</Text>
+                </View>
+                <TouchableOpacity onPress={() => toggleStudent(s.id)} disabled={!canMarkAttendance} style={{ flexDirection: 'row', alignItems: 'center', borderRadius: 20, overflow: 'hidden', opacity: canMarkAttendance ? 1 : 0.5 }}>
+                  <View style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: C.navyMid, borderTopLeftRadius: 20, borderBottomLeftRadius: 20 }}><Text style={{ fontSize: 12, fontWeight: '700', color: C.muted }}>P</Text></View>
+                  <View style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: C.coral, borderTopRightRadius: 20, borderBottomRightRadius: 20 }}><Text style={{ fontSize: 12, fontWeight: '700', color: C.white }}>A</Text></View>
+                </TouchableOpacity>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+        
+        {presList.length > 0 && (
+          <View>
+            <Text style={{ fontSize: 12, fontWeight: '700', color: '#34D399', marginBottom: 8, marginTop: absList.length > 0 ? 16 : 8 }}>PRESENT ({presList.length})</Text>
+            {presList.map((s, idx) => (
+              <TouchableOpacity key={s.id} onPress={() => setSelectedProfileStudent({...s, className: classInfo?.grade})} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border }}>
+                <View style={{ width: 38, height: 38, borderRadius: 19, backgroundColor: C.teal + '33', alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={{ color: C.teal, fontWeight: '700', fontSize: 14 }}>{(s.name[0] || '?').toUpperCase()}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontWeight: '600', fontSize: 14, color: C.white }}>{s.name}</Text>
+                  <Text style={{ color: C.muted, fontSize: 12 }}>{'Roll #'}{s.roll || '–'}</Text>
+                </View>
+                <TouchableOpacity onPress={() => toggleStudent(s.id)} disabled={!canMarkAttendance} style={{ flexDirection: 'row', alignItems: 'center', borderRadius: 20, overflow: 'hidden', opacity: canMarkAttendance ? 1 : 0.5 }}>
+                  <View style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: C.teal, borderTopLeftRadius: 20, borderBottomLeftRadius: 20 }}><Text style={{ fontSize: 12, fontWeight: '700', color: C.white }}>P</Text></View>
+                  <View style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: C.navyMid, borderTopRightRadius: 20, borderBottomRightRadius: 20 }}><Text style={{ fontSize: 12, fontWeight: '700', color: C.muted }}>A</Text></View>
+                </TouchableOpacity>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+      </View>
+    );
+  })()
+  //
+
                     )}
                   </View>
 

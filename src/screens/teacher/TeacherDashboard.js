@@ -7,6 +7,8 @@ import LoadingSpinner from '../../components/LoadingSpinner';
 import Toast from '../../components/Toast';
 import { getFriendlyError } from '../../utils/errorMessages';
 import SideDrawer from '../../components/SideDrawer';
+import Svg, { Circle, Polyline } from 'react-native-svg';
+import DonutRing from '../../components/DonutRing';
 
 const CLASS_COLORS = [C.teal, C.gold, C.purple, C.coral, '#60A5FA', '#F472B6', '#34D399', '#FB923C'];
 
@@ -264,10 +266,418 @@ function normalizeGrade(s) {
   return (s || '').trim().replace(/^Grade\s+/i, '');
 }
 
+
+function formatMonthLabel(monthKey) {
+  if (!monthKey) return '';
+  const [year, month] = monthKey.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+}
+
+function getCurrentAcademicYear() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  if (m >= 5) return `${y}-${String(y + 1).slice(2)}`;
+  return `${y - 1}-${String(y).slice(2)}`;
+}
+
+function adaptCCEStudentSummaryToMarksData(summary) {
+  const entries = Object.entries(summary.subjects || {});
+  const faExam = {
+    examType: 'FA1 + FA2 (Formative)',
+    subjects: entries.map(([sub, d]) => ({ subject: sub, marks: d.faTotal || 0, maxMarks: 40 })),
+    total: entries.reduce((s, [, d]) => s + (d.faTotal || 0), 0),
+    maxTotal: entries.length * 40,
+  };
+  faExam.pct = faExam.maxTotal > 0 ? Math.round((faExam.total / faExam.maxTotal) * 100) : 0;
+  faExam.avg = entries.length > 0 ? Math.round(faExam.total / entries.length) : 0;
+
+  const saEntries = entries.filter(([, d]) => d.sa1 !== null);
+  const saExam = {
+    examType: 'SA1 (Summative)',
+    subjects: saEntries.map(([sub, d]) => ({ subject: sub, marks: d.sa1 || 0, maxMarks: 80 })),
+    total: saEntries.reduce((s, [, d]) => s + (d.sa1 || 0), 0),
+    maxTotal: saEntries.length * 80,
+  };
+  saExam.pct = saExam.maxTotal > 0 ? Math.round((saExam.total / saExam.maxTotal) * 100) : 0;
+  saExam.avg = saEntries.length > 0 ? Math.round(saExam.total / saEntries.length) : 0;
+
+  const byExam = [faExam, ...(saEntries.length > 0 ? [saExam] : [])];
+  const bySubject = entries.map(([sub, d]) => ({
+    subject: sub,
+    avg: d.halfYear !== null ? d.halfYear : (d.faWeight || 0),
+    pct: Math.round((d.gradePoints || 0) * 10),
+  }));
+
+  const totalPoints = entries.reduce((s, [, d]) => s + (d.gradePoints || 0), 0);
+  const overallPct = entries.length > 0 ? Math.round((totalPoints / (entries.length * 10)) * 100) : 0;
+
+  return { success: true, byExam, bySubject, overallPct, total: byExam.reduce((s, e) => s + e.subjects.length, 0) };
+}
+
+const SUB_PALETTE = [C.gold, C.teal, C.purple, C.coral, '#34D399', '#60A5FA', '#F59E0B', '#EC4899'];
+const subColor = (name, idx) => {
+  const map = { maths: C.gold, math: C.gold, mathematics: C.gold, science: C.teal, english: C.purple, social: C.coral, 'social studies': C.coral, 'social science': C.coral, tamil: '#34D399', computer: '#60A5FA', 'computer science': '#60A5FA', hindi: '#F59E0B' };
+  return map[(name || '').toLowerCase()] || SUB_PALETTE[idx % SUB_PALETTE.length];
+};
+const subShort = (name) => (name || '').slice(0, 4);
+
+function getLinePoints(values) {
+  if (!values.length) return '';
+  if (values.length === 1) return `50,12`;
+  const height = 42;
+  const width = 100;
+  return values.map((value, index) => {
+    const x = (index / (values.length - 1)) * width;
+    const clamped = Math.max(0, Math.min(100, Number(value) || 0));
+    const y = height - (clamped / 100) * 30 - 6;
+    return `${x},${y}`;
+  }).join(' ');
+}
+
+export function StudentProfileModal({ visible, onClose, student }) {
+  const [tab, setTab] = React.useState('ATTENDANCE');
+  const [attLoading, setAttLoading] = React.useState(true);
+  const [attData, setAttData] = React.useState([]);
+  const [marksLoading, setMarksLoading] = React.useState(true);
+  const [marksData, setMarksData] = React.useState(null);
+
+  React.useEffect(() => {
+    if (!visible || !student) return;
+    setAttLoading(true);
+    setMarksLoading(true);
+    setTab('ATTENDANCE');
+    
+    const d = new Date();
+    const monthsToFetch = [];
+    for (let i = 0; i < 4; i++) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      monthsToFetch.push(`${y}-${m}`);
+      d.setMonth(d.getMonth() - 1);
+    }
+    Promise.all(monthsToFetch.map(m => apiFetch(`/attendance/student-monthly?studentId=${student.id || student.studentId}&month=${m}`).then(r => r.json()).catch(() => ({}))))
+      .then(results => {
+        const mapped = results.map((res, i) => {
+          const cells = res.cells || [];
+          const summary = res.summary || { present: 0, absent: 0, pct: 0, total: 0 };
+          return { month: monthsToFetch[i], label: formatMonthLabel(monthsToFetch[i]), summary, cells };
+        });
+        setAttData(mapped);
+      })
+      .finally(() => setAttLoading(false));
+
+    const acYear = getCurrentAcademicYear();
+    apiFetch(`/cce/student-summary/${student.id || student.studentId}?academicYear=${acYear}&type=halfyear`)
+      .then(r => r.json())
+      .then(res => {
+        if (res.success) setMarksData(adaptCCEStudentSummaryToMarksData(res));
+        else setMarksData({ byExam: [], bySubject: [], overallPct: 0 });
+      })
+      .catch(() => setMarksData({ byExam: [], bySubject: [], overallPct: 0 }))
+      .finally(() => setMarksLoading(false));
+  }, [visible, student]);
+
+  if (!visible || !student) return null;
+
+  const currentMonth = attData[0];
+  const prevMonths = attData.slice(1);
+
+  return (
+    <Modal transparent animationType="slide" visible onRequestClose={onClose}>
+      <View style={styles.modalOverlay}>
+        <View style={[styles.modalSheet, { height: '90%' }]}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: C.border }}>
+            <View>
+              <Text style={{ fontSize: 20, fontWeight: '700', color: C.white }}>{student.name || student.studentName}</Text>
+              <Text style={{ color: C.muted, fontSize: 13 }}>Grade {student.className || student.class} {'·'} Roll #{student.roll || student.rollNumber || '–'}</Text>
+            </View>
+            <TouchableOpacity onPress={onClose} style={{ backgroundColor: C.border, width: 32, height: 32, borderRadius: 10, alignItems: 'center', justifyContent: 'center' }}>
+              <Text style={{ color: C.white, fontSize: 16 }}>{'✕'}</Text>
+            </TouchableOpacity>
+          </View>
+          
+          <View style={{ flexDirection: 'row', paddingHorizontal: 20, marginTop: 16, marginBottom: 16 }}>
+            <TouchableOpacity onPress={() => setTab('ATTENDANCE')} style={{ flex: 1, paddingVertical: 10, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: tab === 'ATTENDANCE' ? C.teal : 'transparent' }}>
+              <Text style={{ fontWeight: '700', color: tab === 'ATTENDANCE' ? C.teal : C.muted }}>Attendance</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => setTab('MARKS')} style={{ flex: 1, paddingVertical: 10, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: tab === 'MARKS' ? C.gold : 'transparent' }}>
+              <Text style={{ fontWeight: '700', color: tab === 'MARKS' ? C.gold : C.muted }}>Marks / CCE</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={{ flex: 1, paddingHorizontal: 20 }}>
+            {tab === 'ATTENDANCE' && (
+              attLoading ? <ActivityIndicator size="large" color={C.teal} style={{ marginTop: 40 }} /> :
+              <View>
+                {currentMonth && (
+                  <View style={{ backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: C.border }}>
+                    <Text style={{ fontSize: 16, fontWeight: '700', color: C.white, marginBottom: 10 }}>Current Month: {currentMonth.label}</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16, marginBottom: 16 }}>
+                      <DonutRing pct={currentMonth.summary.pct} color={C.teal} size={80} stroke={8} label={`${currentMonth.summary.pct}%`} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: C.white, fontWeight: '700', fontSize: 14 }}>{currentMonth.summary.present} Present</Text>
+                        <Text style={{ color: C.coral, fontWeight: '700', fontSize: 14 }}>{currentMonth.summary.absent} Absent</Text>
+                        <Text style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Out of {currentMonth.summary.total} working days</Text>
+                      </View>
+                    </View>
+                    
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: C.muted, marginBottom: 8, textTransform: 'uppercase' }}>Daily View</Text>
+                    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+                      {Array.from({ length: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate() }, (_, i) => {
+                         const day = i + 1;
+                         const dateStr = `${currentMonth.month}-${String(day).padStart(2, '0')}`;
+                         let status = '–';
+                         let bg = C.navyMid;
+                         let col = C.muted;
+                         
+                         const d = new Date(currentMonth.month + '-' + String(day).padStart(2, '0'));
+                         if (d.getDay() === 0 || d.getDay() === 6) {
+                            status = '–';
+                         } else if (currentMonth.cells && Array.isArray(currentMonth.cells)) {
+                            const c = currentMonth.cells.find(x => x.date === dateStr);
+                            if (c) {
+                               if (c.status === 'Present') { status = '✅'; bg = C.teal + '22'; col = C.teal; }
+                               else if (c.status === 'Absent') { status = '❌'; bg = C.coral + '22'; col = C.coral; }
+                            }
+                         } else if (currentMonth.cells && typeof currentMonth.cells === 'object') {
+                            const c = currentMonth.cells[dateStr];
+                            if (c === 'Present') { status = '✅'; bg = C.teal + '22'; col = C.teal; }
+                            else if (c === 'Absent') { status = '❌'; bg = C.coral + '22'; col = C.coral; }
+                         }
+
+                         return (
+                           <View key={day} style={{ width: '13%', alignItems: 'center', paddingVertical: 6, backgroundColor: bg, borderRadius: 6, borderWidth: 1, borderColor: C.border }}>
+                             <Text style={{ fontSize: 10, color: C.muted, marginBottom: 2 }}>{day}</Text>
+                             <Text style={{ fontSize: 12, color: col }}>{status}</Text>
+                           </View>
+                         );
+                      })}
+                    </View>
+                  </View>
+                )}
+
+                <Text style={{ fontSize: 16, fontWeight: '700', color: C.white, marginBottom: 12 }}>Attendance Trend</Text>
+                <View style={{ backgroundColor: C.navyMid, borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: C.border }}>
+                  <Svg width="100%" height={62} viewBox="0 0 100 42">
+                    <Polyline points="0,36 100,36" stroke={C.border} strokeWidth={1} fill="none" strokeDasharray="3 3" />
+                    <Polyline points={getLinePoints(attData.slice().reverse().map(m => m.summary.pct))} stroke={C.teal} strokeWidth={3} fill="none" strokeLinecap="round" />
+                  </Svg>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
+                    {attData.slice().reverse().map(m => (
+                      <Text key={m.month} style={{ color: C.muted, fontSize: 10 }}>{m.label.slice(0, 3)}</Text>
+                    ))}
+                  </View>
+                </View>
+
+                <Text style={{ fontSize: 16, fontWeight: '700', color: C.white, marginBottom: 12 }}>Previous Months</Text>
+                <View style={{ flexDirection: 'row', gap: 10, marginBottom: 30 }}>
+                  {prevMonths.map(m => (
+                    <View key={m.month} style={{ flex: 1, backgroundColor: C.navyMid, borderRadius: 12, padding: 12, alignItems: 'center', borderWidth: 1, borderColor: C.border }}>
+                      <Text style={{ color: C.teal, fontWeight: '800', fontSize: 18 }}>{m.summary.pct}%</Text>
+                      <Text style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{m.label.slice(0, 3)}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            )}
+
+            {tab === 'MARKS' && (
+              marksLoading ? <ActivityIndicator size="large" color={C.gold} style={{ marginTop: 40 }} /> :
+              !marksData || marksData.total === 0 ? (
+                <View style={{ alignItems: 'center', marginTop: 40 }}>
+                  <Text style={{ fontSize: 40, marginBottom: 12 }}>📋</Text>
+                  <Text style={{ color: C.muted, fontSize: 14 }}>No marks recorded yet.</Text>
+                </View>
+              ) : (
+                <View>
+                  <View style={{ backgroundColor: C.gold + '11', borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: C.gold + '44', flexDirection: 'row', alignItems: 'center', gap: 16 }}>
+                    <DonutRing pct={marksData.overallPct} color={C.gold} size={80} stroke={8} label={`${marksData.overallPct}%`} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.muted, fontSize: 12 }}>Cumulative Average</Text>
+                      <Text style={{ color: C.gold, fontWeight: '900', fontSize: 24 }}>{marksData.overallPct}%</Text>
+                    </View>
+                  </View>
+
+                  <Text style={{ fontSize: 16, fontWeight: '700', color: C.white, marginBottom: 12 }}>Exam Progress</Text>
+                  <View style={{ backgroundColor: C.navyMid, borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: C.border }}>
+                    <Svg width="100%" height={62} viewBox="0 0 100 42">
+                      <Polyline points="0,36 100,36" stroke={C.border} strokeWidth={1} fill="none" strokeDasharray="3 3" />
+                      <Polyline points={getLinePoints(marksData.byExam.map(e => e.pct))} stroke={C.gold} strokeWidth={3} fill="none" strokeLinecap="round" />
+                    </Svg>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
+                      {marksData.byExam.map(e => (
+                        <Text key={e.examType} style={{ color: C.muted, fontSize: 10 }}>{e.examType.split(' ')[0]}</Text>
+                      ))}
+                    </View>
+                  </View>
+
+                  <Text style={{ fontSize: 16, fontWeight: '700', color: C.white, marginBottom: 12 }}>Subject Performance</Text>
+                  <View style={{ backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 30, borderWidth: 1, borderColor: C.border }}>
+                    {marksData.bySubject.map((s, i) => {
+                      const col = subColor(s.subject, i);
+                      return (
+                        <View key={i} style={{ marginBottom: 12 }}>
+                          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                            <Text style={{ fontSize: 13, fontWeight: '600', color: C.white }}>{s.subject}</Text>
+                            <Text style={{ fontSize: 13, fontWeight: '800', color: col }}>{s.pct}%</Text>
+                          </View>
+                          <View style={{ height: 6, backgroundColor: C.border, borderRadius: 3, overflow: 'hidden' }}>
+                            <View style={{ width: `${s.pct}%`, height: '100%', backgroundColor: col }} />
+                          </View>
+                        </View>
+                      );
+                    })}
+                  </View>
+                </View>
+              )
+            )}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function DrillDownSheet({ visible, onClose, classData, attendanceStats, onStudentSelect }) {
+  const [step, setStep] = React.useState(1);
+  const [selectedClass, setSelectedClass] = React.useState(null);
+  const [students, setStudents] = React.useState({ present: [], absent: [], loading: false });
+
+  React.useEffect(() => {
+    if (visible) setStep(1);
+  }, [visible]);
+
+  const grades = Object.keys(classData);
+
+  const handleClassClick = async (grade) => {
+    const classId = classData[grade]?.id;
+    if (!classId) return;
+    setStep(2);
+    setSelectedClass(grade);
+    setStudents({ present: [], absent: [], loading: true });
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const [attRes, stdRes] = await Promise.all([
+        apiFetch(`/attendance/records?classId=${classId}&date=${today}`),
+        apiFetch(`/students/${classId}?t=` + Date.now())
+      ]);
+      const attData = await attRes.json();
+      const stdData = await stdRes.json();
+      
+      const recordsMap = {};
+      if (attData.records) {
+        attData.records.forEach(r => { recordsMap[r.studentId] = r.status; });
+      }
+      
+      const present = [];
+      const absent = [];
+      (stdData.students || []).forEach(s => {
+        const stat = recordsMap[s.id] || 'Present';
+        if (stat === 'Absent') absent.push(s);
+        else present.push(s);
+      });
+      setStudents({ present, absent, loading: false });
+    } catch (e) {
+      setStudents({ present: [], absent: [], loading: false });
+    }
+  };
+
+  if (!visible) return null;
+
+  return (
+    <Modal transparent animationType="slide" visible onRequestClose={onClose}>
+      <View style={styles.modalOverlay}>
+        <View style={[styles.modalSheet, { height: '85%' }]}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: C.border }}>
+            {step === 2 ? (
+              <TouchableOpacity onPress={() => setStep(1)} style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Icon name="back" size={16} color={C.white} />
+                <Text style={{ fontSize: 18, fontWeight: '700', color: C.white }}>Grade {selectedClass}</Text>
+              </TouchableOpacity>
+            ) : (
+              <Text style={{ fontSize: 20, fontWeight: '700', color: C.white }}>Assigned Classes</Text>
+            )}
+            <TouchableOpacity onPress={onClose} style={{ backgroundColor: C.border, width: 32, height: 32, borderRadius: 10, alignItems: 'center', justifyContent: 'center' }}>
+              <Text style={{ color: C.white, fontSize: 16 }}>{'✕'}</Text>
+            </TouchableOpacity>
+          </View>
+          
+          <ScrollView style={{ flex: 1, padding: 20 }}>
+            {step === 1 && (
+              grades.length === 0 ? <Text style={{ color: C.muted, textAlign: 'center', marginTop: 40 }}>No classes assigned.</Text> :
+              grades.map((g, i) => {
+                const id = classData[g]?.id;
+                const att = id ? attendanceStats[id] : null;
+                const total = classData[g]?.studentCount || 0;
+                const present = att ? att.present : 0;
+                const absent = att ? att.total - att.present : (total > 0 ? total : 0);
+                return (
+                  <TouchableOpacity key={i} onPress={() => handleClassClick(g)} style={{ backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: C.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <View>
+                      <Text style={{ fontSize: 16, fontWeight: '700', color: C.white }}>Grade {g}</Text>
+                      <Text style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>{total} students</Text>
+                    </View>
+                    <View style={{ flexDirection: 'row', gap: 12 }}>
+                      <View style={{ alignItems: 'center' }}>
+                        <Text style={{ color: '#34D399', fontWeight: '800', fontSize: 16 }}>{present}</Text>
+                        <Text style={{ color: C.muted, fontSize: 10 }}>Present</Text>
+                      </View>
+                      <View style={{ alignItems: 'center' }}>
+                        <Text style={{ color: C.coral, fontWeight: '800', fontSize: 16 }}>{absent}</Text>
+                        <Text style={{ color: C.muted, fontSize: 10 }}>Absent</Text>
+                      </View>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })
+            )}
+
+            {step === 2 && (
+              students.loading ? <ActivityIndicator size="large" color={C.teal} style={{ marginTop: 40 }} /> :
+              <View>
+                <Text style={{ fontSize: 14, fontWeight: '700', color: C.coral, marginBottom: 10, textTransform: 'uppercase' }}>Absent ({students.absent.length})</Text>
+                {students.absent.map((s, i) => (
+                  <TouchableOpacity key={i} onPress={() => onStudentSelect({ ...s, className: selectedClass })} style={{ backgroundColor: C.coral + '11', borderRadius: 12, padding: 12, marginBottom: 8, borderWidth: 1, borderColor: C.coral + '33', flexDirection: 'row', alignItems: 'center' }}>
+                    <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: C.coral + '33', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                      <Text style={{ color: C.coral, fontWeight: '700' }}>{(s.name || s.studentName || '?')[0]}</Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.white, fontWeight: '600', fontSize: 14 }}>{s.name || s.studentName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11 }}>Roll #{s.roll || s.rollNumber || '-'}</Text>
+                    </View>
+                  </TouchableOpacity>
+                ))}
+                {students.absent.length === 0 && <Text style={{ color: C.muted, fontSize: 13, marginBottom: 16 }}>No absent students today.</Text>}
+
+                <Text style={{ fontSize: 14, fontWeight: '700', color: '#34D399', marginTop: 16, marginBottom: 10, textTransform: 'uppercase' }}>Present ({students.present.length})</Text>
+                {students.present.map((s, i) => (
+                  <TouchableOpacity key={i} onPress={() => onStudentSelect({ ...s, className: selectedClass })} style={{ backgroundColor: '#34D39911', borderRadius: 12, padding: 12, marginBottom: 8, borderWidth: 1, borderColor: '#34D39933', flexDirection: 'row', alignItems: 'center' }}>
+                    <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: '#34D39933', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                      <Text style={{ color: '#34D399', fontWeight: '700' }}>{(s.name || s.studentName || '?')[0]}</Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.white, fontWeight: '600', fontSize: 14 }}>{s.name || s.studentName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11 }}>Roll #{s.roll || s.rollNumber || '-'}</Text>
+                    </View>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 export default function TeacherDashboard({ onNavigate, currentUser, onLogout, currentScreen }) {
   console.log('[TeacherDashboard] mounting, user:', currentUser?.role_id || 'no-id');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [showTodaySheet, setShowTodaySheet] = useState(false);
+  const [drillDownVisible, setDrillDownVisible] = useState(false);
+  const [selectedProfileStudent, setSelectedProfileStudent] = useState(null);
   const [onDuty, setOnDuty] = useState(false);
   const [dutyLoading, setDutyLoading] = useState(false);
   const [clockInTime, setClockInTime] = useState(null);
@@ -497,13 +907,13 @@ export default function TeacherDashboard({ onNavigate, currentUser, onLogout, cu
 
         <View style={{ flexDirection: 'row', gap: 10, marginBottom: 20 }}>
           {[
-            { val: loading ? '—' : String(todayClasses.length), lbl: 'Classes Today', color: C.teal, tap: true },
-            { val: loading ? '—' : String(totalStudents), lbl: 'Total Students', color: C.gold, tap: false },
-            { val: loading ? '—' : String(totalPresent), lbl: 'Present', color: '#34D399', tap: false },
+            { val: loading ? '—' : String(todayClasses.length), lbl: 'Classes Today', color: C.teal, tap: true, onTap: () => setShowTodaySheet(true) },
+            { val: loading ? '—' : String(totalStudents), lbl: 'Total Students', color: C.gold, tap: true, onTap: () => setDrillDownVisible(true) },
+            { val: loading ? '—' : String(totalPresent), lbl: 'Present', color: '#34D399', tap: true, onTap: () => setDrillDownVisible(true) },
           ].map(m => (
             <TouchableOpacity
               key={m.lbl}
-              onPress={m.tap ? () => setShowTodaySheet(true) : undefined}
+              onPress={m.tap ? m.onTap : undefined}
               style={{
                 flex: 1, backgroundColor: C.card, borderWidth: 1,
                 borderColor: m.tap ? C.teal + '55' : C.border,
@@ -736,6 +1146,18 @@ export default function TeacherDashboard({ onNavigate, currentUser, onLogout, cu
         })}
       </View>
       </ScrollView>
+    <DrillDownSheet 
+      visible={drillDownVisible} 
+      onClose={() => setDrillDownVisible(false)} 
+      classData={classData} 
+      attendanceStats={attendanceStats} 
+      onStudentSelect={(s) => { setDrillDownVisible(false); setSelectedProfileStudent(s); }} 
+    />
+    <StudentProfileModal 
+      visible={!!selectedProfileStudent} 
+      onClose={() => setSelectedProfileStudent(null)} 
+      student={selectedProfileStudent} 
+    />
     {showTodaySheet && (
       <TodayClassesSheet
         onClose={() => setShowTodaySheet(false)}
