@@ -120,7 +120,40 @@ function NotifCard({ notif, onPress, isNew }) {
   );
 }
 
+
+function BirthdaysHeader({ birthdays }) {
+  if (!birthdays) return null;
+  const dateStr = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  return (
+    <View style={{ backgroundColor: C.navyMid, borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: C.border }}>
+      <Text style={{ fontSize: 16, fontWeight: '800', color: C.white, marginBottom: 12 }}>🎂 TODAY'S BIRTHDAYS — {dateStr}</Text>
+      <View style={{ height: 1, backgroundColor: C.border, marginBottom: 12 }} />
+      
+      {birthdays.students && birthdays.students.length > 0 && (
+        <View style={{ marginBottom: 12 }}>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: C.teal, marginBottom: 8, textTransform: 'uppercase' }}>👨‍🎓 STUDENTS</Text>
+          {birthdays.students.map((s, i) => {
+            const age = s.dob ? (new Date().getFullYear() - new Date(s.dob).getFullYear()) : '?';
+            return <Text key={i} style={{ color: C.white, fontSize: 14, marginBottom: 4 }}>🎂 {s.name || s.studentName} | Class {s.className || s.class} | Age {age}</Text>;
+          })}
+        </View>
+      )}
+
+      {birthdays.staff && birthdays.staff.length > 0 && (
+        <View>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: C.gold, marginBottom: 8, textTransform: 'uppercase' }}>👤 STAFF</Text>
+          {birthdays.staff.map((s, i) => (
+            <Text key={i} style={{ color: C.white, fontSize: 14, marginBottom: 4 }}>🎂 {s.name} | {s.role || 'Staff'}</Text>
+          ))}
+        </View>
+      )}
+      <View style={{ height: 1, backgroundColor: C.border, marginTop: 8 }} />
+    </View>
+  );
+}
+
 export default function AdminNotificationsScreen({ onBack, schoolId }) {
+  const [birthdays, setBirthdays]   = useState(null);
   const [notifs, setNotifs]         = useState([]);
   const [loading, setLoading]       = useState(true);
   const [markingAll, setMarkingAll] = useState(false);
@@ -130,6 +163,18 @@ export default function AdminNotificationsScreen({ onBack, schoolId }) {
   const unreadCount = notifs.filter(n => !n.read).length;
 
   // ── Real-time Firestore listener ───────────────────────────────
+  
+  useEffect(() => {
+    apiFetch(`/birthdays/today?schoolId=${schoolId}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.success && (data.students?.length > 0 || data.staff?.length > 0)) {
+          setBirthdays(data);
+        }
+      })
+      .catch(err => console.warn('Failed to fetch birthdays', err));
+  }, [schoolId]);
+
   useEffect(() => {
     if (!db || !schoolId) {
       // Fallback to polling if no schoolId or Firestore not available
@@ -308,6 +353,7 @@ export default function AdminNotificationsScreen({ onBack, schoolId }) {
               isNew={newIds.has(item.id)}
             />
           )}
+          ListHeaderComponent={<BirthdaysHeader birthdays={birthdays} />}
           contentContainerStyle={{ padding: 16, gap: 10 }}
           showsVerticalScrollIndicator={false}
         />

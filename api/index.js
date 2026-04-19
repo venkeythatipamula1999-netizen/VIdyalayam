@@ -10666,4 +10666,128 @@ if (!process.env.VERCEL) {
 }
 
 // Export for Vercel Serverless
-module.exports = app;
+
+app.get('/api/birthdays/today', verifyAuth, async (req, res) => {
+  try {
+    const today = new Date();
+    // Assuming DOBs are stored in 'YYYY-MM-DD' or 'DD/MM/YYYY' or 'YYYY-M-D' etc.
+    // To make it robust, we'll fetch all and filter in JS since Firestore can't easily query substring.
+    const month = today.getMonth() + 1;
+    const date = today.getDate();
+    
+    // We'll consider match if DOB string contains `-${String(month).padStart(2,'0')}-${String(date).padStart(2,'0')}`
+    // or if parsed date matches month & day.
+    function isBirthday(dobStr) {
+      if (!dobStr) return false;
+      try {
+        const d = new Date(dobStr);
+        if (!isNaN(d.getTime())) {
+          return (d.getMonth() + 1 === month && d.getDate() === date);
+        }
+        // Fallback simple parsing
+        const parts = dobStr.split(/[-/]/);
+        if (parts.length >= 3) {
+          if (parts[0].length === 4) { // YYYY-MM-DD
+            return parseInt(parts[1], 10) === month && parseInt(parts[2], 10) === date;
+          } else { // DD-MM-YYYY
+            return parseInt(parts[1], 10) === month && parseInt(parts[0], 10) === date;
+          }
+        }
+        return false;
+      } catch(e) { return false; }
+    }
+
+    const schoolId = req.query.schoolId || req.schoolId || DEFAULT_SCHOOL_ID;
+    
+    const [studentsSnap, staffSnap, classesSnap, usersSnap] = await Promise.all([
+      adminDb.collection('students').get(),
+      adminDb.collection('users').get(), // Staff
+      adminDb.collection('classes').get(), // To map class to teacher
+      adminDb.collection('users').get() // To get all users for notifications
+    ]);
+
+    const bdayStudents = [];
+    studentsSnap.forEach(doc => {
+      const data = doc.data();
+      if (isBirthday(data.dob)) {
+        bdayStudents.push({ id: doc.id, ...data });
+      }
+    });
+
+    const bdayStaff = [];
+    const allUsers = [];
+    usersSnap.forEach(doc => {
+      const data = doc.data();
+      allUsers.push({ id: doc.id, ...data });
+      if (isBirthday(data.dob || data.dateOfBirth)) {
+        bdayStaff.push({ id: doc.id, ...data });
+      }
+    });
+
+    // Map classes to teachers
+    const classToTeacher = {};
+    classesSnap.forEach(doc => {
+      const data = doc.data();
+      if (data.teacherId) {
+        classToTeacher[doc.id] = data.teacherId;
+        classToTeacher[data.name] = data.teacherId;
+        classToTeacher[data.grade] = data.teacherId;
+      }
+    });
+
+    // Send Notifications
+    if (req.query.notify === 'true') {
+      const admins = allUsers.filter(u => u.role === 'admin');
+      
+      // Admin notifications
+      admins.forEach(admin => {
+        bdayStudents.forEach(stu => {
+          const age = stu.dob ? (new Date().getFullYear() - new Date(stu.dob).getFullYear()) : '?';
+          sendPushNotification(admin.id, `🎂 ${stu.name || stu.studentName}'s Birthday!`, `Class ${stu.className || stu.class} | Age ${age}`, { type: 'birthday' });
+        });
+        bdayStaff.forEach(staff => {
+          sendPushNotification(admin.id, `🎂 ${staff.name}'s Birthday!`, `${staff.role}`, { type: 'birthday' });
+        });
+      });
+
+      // Teacher notifications
+      bdayStudents.forEach(stu => {
+        const tId = classToTeacher[stu.classId] || classToTeacher[stu.className] || classToTeacher[stu.class];
+        if (tId) {
+          sendPushNotification(tId, `🎂 ${stu.name || stu.studentName}'s Birthday!`, `Class ${stu.className || stu.class} | Celebrate today! 🎉`, { type: 'birthday' });
+        }
+      });
+
+      // Staff notifications
+      allUsers.forEach(user => {
+        if (user.role === 'admin' || user.role === 'parent' || user.role === 'student') return; // admins handled above
+        bdayStaff.forEach(staff => {
+          if (staff.id !== user.id) { // don't notify self
+            sendPushNotification(user.id, `🎂 ${staff.name}'s Birthday!`, `Wish them today! 🎉`, { type: 'birthday' });
+          }
+        });
+      });
+    }
+
+    
+    let finalStudents = bdayStudents;
+    let finalStaff = bdayStaff;
+    
+    // If the caller is a teacher, filter students to only their assigned classes
+    if (req.user && req.user.role === 'teacher') {
+      const myClasses = Object.keys(classToTeacher).filter(k => classToTeacher[k] === req.user.id);
+      finalStudents = bdayStudents.filter(s => myClasses.includes(s.classId) || myClasses.includes(s.className) || myClasses.includes(s.class));
+      finalStaff = []; // Teachers don't see staff birthdays in their class panel
+    } else if (req.user && req.user.role !== 'admin') {
+      // General staff sees other staff, but not students
+      finalStudents = [];
+    }
+    
+    res.json({ success: true, students: finalStudents, staff: finalStaff });
+
+  } catch (error) {
+    console.error('Error fetching birthdays:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+\nmodule.exports = app;
