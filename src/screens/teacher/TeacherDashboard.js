@@ -4,6 +4,7 @@ import { C } from '../../theme/colors';
 import Icon from '../../components/Icon';
 import { apiFetch } from '../../api/client';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import Toast from '../../components/Toast';
 import { getFriendlyError } from '../../utils/errorMessages';
 import SideDrawer from '../../components/SideDrawer';
 
@@ -28,6 +29,83 @@ function getTodayDay() {
 function getNowMins() {
   const d = new Date();
   return d.getHours() * 60 + d.getMinutes();
+}
+
+function formatDateKey(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function getMonthYearParts(date = new Date()) {
+  return {
+    month: String(date.getMonth() + 1).padStart(2, '0'),
+    year: String(date.getFullYear()),
+  };
+}
+
+function getEventStartTime(ev) {
+  return ev?.startTime || ev?.time || '';
+}
+
+function getEventType(ev) {
+  const raw = String(ev?.type || ev?.category || '').trim().toLowerCase();
+  if (raw.includes('holiday')) return 'holiday';
+  if (raw.includes('meeting') || raw.includes('cultural')) return 'meeting';
+  return 'meeting';
+}
+
+function getEventIcon(type) {
+  if (type === 'holiday') return '🔴';
+  if (type === 'meeting') return '👥';
+  return '📚';
+}
+
+function getEventTitle(ev) {
+  return ev?.title || ev?.name || ev?.subject || 'School Event';
+}
+
+function buildTodayScheduleItems(timetable, calendarEvents, todayDay, todayKey) {
+  const holidayEvent = calendarEvents.find((ev) => ev.date === todayKey && getEventType(ev) === 'holiday');
+  if (holidayEvent) {
+    return [{
+      id: `holiday-${holidayEvent.id || holidayEvent.date}`,
+      kind: 'holiday',
+      icon: '🔴',
+      time: 'Full Day',
+      className: 'Holiday',
+      subject: getEventTitle(holidayEvent),
+      sortKey: -1,
+    }];
+  }
+
+  const classItems = timetable
+    .filter((entry) => (entry.days || []).includes(todayDay))
+    .map((entry, index) => ({
+      id: `class-${entry.id || index}-${entry.className}-${entry.subject}`,
+      kind: 'class',
+      icon: '📚',
+      time: formatTimeRange(entry.startTime, entry.endTime),
+      className: `Grade ${entry.className}`,
+      subject: entry.subject || 'Class',
+      sortKey: parseTimeMins(entry.startTime) ?? (index + 1) * 1000,
+    }));
+
+  const eventItems = calendarEvents
+    .filter((ev) => ev.date === todayKey && getEventType(ev) !== 'holiday')
+    .map((ev, index) => {
+      const eventType = getEventType(ev);
+      const startTime = getEventStartTime(ev);
+      return {
+        id: `event-${ev.id || index}-${ev.date}-${eventType}`,
+        kind: eventType,
+        icon: getEventIcon(eventType),
+        time: startTime || 'School Hours',
+        className: 'Staff Event',
+        subject: getEventTitle(ev),
+        sortKey: parseTimeMins(startTime) ?? (2000 + index),
+      };
+    });
+
+  return [...classItems, ...eventItems].sort((a, b) => a.sortKey - b.sortKey);
 }
 
 function getClassStatus(entry) {
@@ -198,13 +276,19 @@ export default function TeacherDashboard({ onNavigate, currentUser, onLogout, cu
   const [attendanceStats, setAttendanceStats] = useState({});
   const [loading, setLoading] = useState(true);
   const [freshTimetable, setFreshTimetable] = useState(null);
+  const [todayScheduleLoading, setTodayScheduleLoading] = useState(true);
+  const [todayScheduleError, setTodayScheduleError] = useState('');
+  const [todayScheduleItems, setTodayScheduleItems] = useState([]);
+  const [toast, setToast] = useState({ visible: false, message: '', type: 'success' });
 
   const displayName = currentUser?.full_name || 'Teacher';
   const teacherId = currentUser?.role_id || '';
+  const showToast = (message, type = 'success') => setToast({ visible: true, message, type });
 
   const rawTimetable = freshTimetable !== null ? freshTimetable : currentUser?.timetable;
   const timetable = Array.isArray(rawTimetable) ? rawTimetable : [];
   const todayDay = getTodayDay();
+  const todayKey = formatDateKey(new Date());
   const todayClasses = timetable
     .filter(e => (e.days || []).includes(todayDay))
     .sort((a, b) => (parseTimeMins(a.startTime) || 0) - (parseTimeMins(b.startTime) || 0));
@@ -264,6 +348,45 @@ export default function TeacherDashboard({ onNavigate, currentUser, onLogout, cu
     }
     loadData();
   }, [teacherId]);
+
+  const loadTodaySchedule = useCallback(async () => {
+    if (!teacherId) {
+      setTodayScheduleItems([]);
+      setTodayScheduleLoading(false);
+      return;
+    }
+
+    setTodayScheduleLoading(true);
+    setTodayScheduleError('');
+    try {
+      const { month, year } = getMonthYearParts(new Date());
+      const [calendarRes, timetableRes] = await Promise.all([
+        apiFetch(`/teacher-calendar?roleId=${encodeURIComponent(teacherId)}&month=${month}&year=${year}`),
+        apiFetch(`/teacher-timetable?roleId=${encodeURIComponent(teacherId)}&t=${Date.now()}`, { cache: 'no-store' }),
+      ]);
+      const [calendarData, timetableData] = await Promise.all([
+        calendarRes.json(),
+        timetableRes.json(),
+      ]);
+
+      const liveTimetable = Array.isArray(timetableData?.timetable) && timetableData.timetable.length > 0
+        ? timetableData.timetable
+        : timetable;
+      const calendarEvents = calendarRes.ok && Array.isArray(calendarData?.events) ? calendarData.events : [];
+
+      setTodayScheduleItems(buildTodayScheduleItems(liveTimetable, calendarEvents, todayDay, todayKey));
+    } catch (e) {
+      const message = getFriendlyError(e, 'Failed to load today\'s schedule');
+      setTodayScheduleError(message);
+      showToast(message, 'error');
+    } finally {
+      setTodayScheduleLoading(false);
+    }
+  }, [teacherId, timetable, todayDay, todayKey]);
+
+  useEffect(() => {
+    loadTodaySchedule();
+  }, [loadTodaySchedule]);
 
   useEffect(() => {
     if (!teacherId) return;
@@ -395,6 +518,58 @@ export default function TeacherDashboard({ onNavigate, currentUser, onLogout, cu
               {m.tap && <Text style={{ fontSize: 9, color: C.teal, marginTop: 4, fontWeight: '600' }}>Tap to view</Text>}
             </TouchableOpacity>
           ))}
+        </View>
+
+        <View style={{ backgroundColor: C.navyMid || C.card, borderWidth: 1, borderColor: C.border, borderRadius: 20, padding: 16, marginBottom: 20 }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <View style={{ flex: 1, marginRight: 10 }}>
+              <Text style={{ fontSize: 16, fontWeight: '700', color: C.white }}>Today's Schedule</Text>
+              <Text style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>Classes and staff events in time order</Text>
+            </View>
+            <TouchableOpacity onPress={loadTodaySchedule} style={{ paddingVertical: 6, paddingHorizontal: 10, borderRadius: 10, backgroundColor: (C.navyDark || C.navy) + '66', borderWidth: 1, borderColor: C.border }}>
+              <Text style={{ color: C.teal, fontSize: 11, fontWeight: '700' }}>Refresh</Text>
+            </TouchableOpacity>
+          </View>
+
+          {todayScheduleLoading ? (
+            <LoadingSpinner message="Loading today's schedule..." />
+          ) : todayScheduleError ? (
+            <View style={{ backgroundColor: C.navyDark || C.navy, borderRadius: 16, borderWidth: 1, borderColor: C.coral + '44', padding: 16 }}>
+              <Text style={{ color: C.white, fontWeight: '700', fontSize: 14, marginBottom: 6 }}>Couldn't load today's schedule</Text>
+              <Text style={{ color: C.muted, fontSize: 12, lineHeight: 18, marginBottom: 12 }}>{todayScheduleError}</Text>
+              <TouchableOpacity onPress={loadTodaySchedule} style={{ alignSelf: 'flex-start', backgroundColor: C.coral + '22', borderWidth: 1, borderColor: C.coral + '44', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10 }}>
+                <Text style={{ color: C.coral, fontSize: 12, fontWeight: '700' }}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <ScrollView nestedScrollEnabled style={{ maxHeight: 260 }} showsVerticalScrollIndicator={false}>
+              {todayScheduleItems.length === 0 ? (
+                <View style={{ backgroundColor: C.navyDark || C.navy, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 18, alignItems: 'center' }}>
+                  <Text style={{ color: C.white, fontSize: 15, fontWeight: '700', marginBottom: 6 }}>No classes scheduled today</Text>
+                  <Text style={{ color: C.muted, fontSize: 12, textAlign: 'center' }}>Your classes and staff events for today will appear here.</Text>
+                </View>
+              ) : todayScheduleItems[0]?.kind === 'holiday' ? (
+                <View style={{ backgroundColor: C.coral + '14', borderRadius: 16, borderWidth: 1, borderColor: C.coral + '44', padding: 18 }}>
+                  <Text style={{ color: C.coral, fontSize: 14, fontWeight: '800', marginBottom: 6 }}>🔴 Holiday</Text>
+                  <Text style={{ color: C.white, fontSize: 15, fontWeight: '700' }}>Holiday — {todayScheduleItems[0].subject}</Text>
+                  <Text style={{ color: C.muted, fontSize: 12, marginTop: 6 }}>Today's classes are blocked for the full day.</Text>
+                </View>
+              ) : (
+                todayScheduleItems.map((item, index) => (
+                  <View key={item.id} style={{ flexDirection: 'row', gap: 12, backgroundColor: C.navyDark || C.navy, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 14, marginBottom: index === todayScheduleItems.length - 1 ? 0 : 10 }}>
+                    <View style={{ width: 42, height: 42, borderRadius: 14, backgroundColor: item.kind === 'class' ? C.teal + '22' : C.purple + '22', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <Text style={{ fontSize: 18 }}>{item.icon}</Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: item.kind === 'class' ? C.teal : C.purple, fontSize: 12, fontWeight: '700', marginBottom: 4 }}>{'\u23F0'} {item.time}</Text>
+                      <Text style={{ color: C.white, fontSize: 14, fontWeight: '700', marginBottom: 3 }}>{'\uD83C\uDFEB'} {item.className}</Text>
+                      <Text style={{ color: C.muted, fontSize: 12, lineHeight: 18 }}>{'\uD83D\uDCD6'} {item.subject}</Text>
+                    </View>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+          )}
         </View>
 
         {featuredClass && (
@@ -579,6 +754,7 @@ export default function TeacherDashboard({ onNavigate, currentUser, onLogout, cu
       role="teacher"
       currentScreen={currentScreen}
     />
+    <Toast {...toast} onHide={() => setToast(t => ({ ...t, visible: false }))} />
     </View>
   );
 }

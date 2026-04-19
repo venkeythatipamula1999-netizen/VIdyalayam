@@ -47,7 +47,7 @@ export default function Icon({ name, size = 20, color = '#FFFFFF' }) {
     case 'fee':
       return <Svg {...props}><Line x1={12} y1={1} x2={12} y2={23} {...sp} /><Path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6" {...sp} /></Svg>;
     case 'leave':
-      return <Svg {...props}><Rect x={3} y={4} width={18} height={18} rx={2} ry={2} {...sp} /><Line x1={16} y1={2} x2={16} y2={6} {...sp} /><Line x1={8} y1={2} x2={8} y2={6} {...sp} /><Line x1={3} y1={10} x2={21} y2={10} {...sp} /></Svg>;
+      return <Svg {...props}><Path d="M12 3c-1.5 2-4 3.5-7 3.5" {...sp} /><Path d="M12 3c1.5 2 4 3.5 7 3.5" {...sp} /><Path d="M12 3c-1 2.5-1 5-1 8" {...sp} /><Path d="M12 3c1 2.5 1 5 1 8" {...sp} /><Line x1={12} y1={3} x2={12} y2={21} {...sp} /><Path d="M7 21h10" {...sp} /><Circle cx={19} cy={5} r={2} fill={color} stroke={color} strokeWidth={1} /></Svg>;
     case 'scan':
       return <Svg {...props}><Rect x={3} y={3} width={7} height={7} {...sp} /><Rect x={14} y={3} width={7} height={7} {...sp} /><Rect x={3} y={14} width={7} height={7} {...sp} /><Rect x={14} y={14} width={3} height={3} {...sp} /></Svg>;
     case 'clock':

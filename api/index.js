@@ -142,6 +142,9 @@ try {
 let adminDb = null;
 try {
   adminDb = admin.firestore();
+  if (typeof adminDb.settings === 'function') {
+    adminDb.settings({ preferRest: true });
+  }
   console.log('[Firebase Admin] Firestore initialized');
 } catch (e) {
   console.warn('[Firebase Admin] Firestore init failed:', e.message);

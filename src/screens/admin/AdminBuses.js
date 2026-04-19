@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, ScrollView,
   Modal, ActivityIndicator, TextInput, BackHandler,
@@ -6,12 +6,47 @@ import {
 import { C } from '../../theme/colors';
 import Icon from '../../components/Icon';
 import { apiFetch } from '../../api/client';
+import LoadingSpinner from '../../components/LoadingSpinner';
 import Toast from '../../components/Toast';
 import { getFriendlyError } from '../../utils/errorMessages';
+
+function getIstTodayKey() {
+  return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+}
+
+function getStudentId(student) {
+  return String(student?.studentId || student?.id || '');
+}
+
+function getStudentName(student) {
+  return student?.name || student?.studentName || 'Student';
+}
+
+function getStudentClass(student) {
+  return student?.className || student?.class || student?.studentClass || '—';
+}
+
+function isDateWithin(dateKey, fromDate, toDate) {
+  if (!dateKey || !fromDate) return false;
+  const start = String(fromDate).slice(0, 10);
+  const end = String(toDate || fromDate).slice(0, 10);
+  return dateKey >= start && dateKey <= end;
+}
+
+function isApprovedLeaveToday(leave, dateKey) {
+  return String(leave?.status || '').toLowerCase() === 'approved'
+    && isDateWithin(dateKey, leave?.from || leave?.startDate, leave?.to || leave?.endDate);
+}
+
+function formatScanTimestamp(timestamp) {
+  if (!timestamp) return '—';
+  return new Date(timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+}
 
 export default function AdminBuses({ onBack, currentUser }) {
   const [buses, setBuses] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('manage');
   const [selectedBus, setSelectedBus] = useState(null);
   const [onboardStudents, setOnboardStudents] = useState([]);
   const [modalLoading, setModalLoading] = useState(false);
@@ -34,6 +69,10 @@ export default function AdminBuses({ onBack, currentUser }) {
   const [studentsLoading, setStudentsLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [toast, setToast] = useState({ visible: false, message: '', type: 'success' });
+  const [busSummaryLoading, setBusSummaryLoading] = useState(true);
+  const [busSummaryError, setBusSummaryError] = useState('');
+  const [busSummaries, setBusSummaries] = useState([]);
+  const [selectedBusSummary, setSelectedBusSummary] = useState(null);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => { onBack(); return true; });
@@ -55,6 +94,125 @@ export default function AdminBuses({ onBack, currentUser }) {
   };
 
   useEffect(() => { fetchBuses(); }, []);
+
+  const fetchBusSummaries = useCallback(async (showLoader = true) => {
+    if (showLoader) setBusSummaryLoading(true);
+    setBusSummaryError('');
+    try {
+      const todayKey = getIstTodayKey();
+      const [busesRes, leavesRes] = await Promise.all([
+        apiFetch('/admin/buses?t=' + Date.now(), { cache: 'no-store' }),
+        apiFetch('/leave-requests/students?t=' + Date.now(), { cache: 'no-store' }),
+      ]);
+
+      const [busesData, leavesData] = await Promise.all([busesRes.json(), leavesRes.json()]);
+      const summaryBuses = busesData.buses || [];
+      const leaveRequests = leavesData.requests || leavesData.leaves || [];
+      const approvedLeavesToday = leaveRequests.filter(req => isApprovedLeaveToday(req, todayKey));
+
+      const summaries = await Promise.all(
+        summaryBuses.map(async (bus) => {
+          const busId = bus.busId || bus.id || '';
+          const busNumber = bus.busNumber || busId;
+          const [passengersRes, scansRes] = await Promise.all([
+            apiFetch(`/bus/passengers?busId=${encodeURIComponent(busId)}&t=${Date.now()}`, { cache: 'no-store' }),
+            apiFetch(`/trip/scans?busNumber=${encodeURIComponent(busNumber)}&t=${Date.now()}`, { cache: 'no-store' }),
+          ]);
+
+          const [passengersData, scansData] = await Promise.all([passengersRes.json(), scansRes.json()]);
+          const passengers = passengersData.passengers || [];
+          const scans = scansData.scans || [];
+
+          const boardedScanMap = {};
+          scans
+            .filter(scan => scan.type === 'board')
+            .sort((a, b) => (a.timestamp || a.createdAt || '').localeCompare(b.timestamp || b.createdAt || ''))
+            .forEach((scan) => {
+              boardedScanMap[String(scan.studentId || '')] = scan;
+            });
+
+          const leaveStudentMap = {};
+          approvedLeavesToday.forEach((leave) => {
+            const leaveStudentId = String(leave.studentId || '');
+            if (!leaveStudentId) return;
+            if (!passengers.some(student => getStudentId(student) === leaveStudentId)) return;
+            const matchedStudent = passengers.find(student => getStudentId(student) === leaveStudentId);
+            leaveStudentMap[leaveStudentId] = {
+              studentId: leaveStudentId,
+              studentName: leave.studentName || getStudentName(matchedStudent),
+              className: leave.studentClass || getStudentClass(matchedStudent),
+            };
+          });
+
+          const boardedStudents = passengers
+            .filter(student => boardedScanMap[getStudentId(student)])
+            .map(student => {
+              const scan = boardedScanMap[getStudentId(student)];
+              return {
+                studentId: getStudentId(student),
+                studentName: scan?.studentName || getStudentName(student),
+                className: scan?.className || getStudentClass(student),
+                scanTime: scan?.timestamp || scan?.createdAt || '',
+              };
+            })
+            .sort((a, b) => (a.scanTime || '').localeCompare(b.scanTime || ''));
+
+          const onLeaveStudents = Object.values(leaveStudentMap).sort((a, b) => a.studentName.localeCompare(b.studentName));
+
+          const notBoardedStudents = passengers
+            .filter(student => {
+              const studentId = getStudentId(student);
+              return !boardedScanMap[studentId] && !leaveStudentMap[studentId];
+            })
+            .map(student => ({
+              studentId: getStudentId(student),
+              studentName: getStudentName(student),
+              className: getStudentClass(student),
+            }))
+            .sort((a, b) => a.studentName.localeCompare(b.studentName));
+
+          const recentScans = scans
+            .slice()
+            .sort((a, b) => (b.timestamp || b.createdAt || '').localeCompare(a.timestamp || a.createdAt || ''))
+            .map(scan => ({
+              id: scan.id || `${scan.studentId}_${scan.timestamp}`,
+              studentName: scan.studentName || 'Student',
+              className: scan.className || '—',
+              timestamp: scan.timestamp || scan.createdAt || '',
+              type: scan.type || '',
+            }));
+
+          return {
+            id: busId || busNumber,
+            busId,
+            busNumber,
+            studentsAllotted: passengers.length,
+            boardedToday: boardedStudents.length,
+            absent: notBoardedStudents.length,
+            boardedStudents,
+            notBoardedStudents,
+            onLeaveStudents,
+            recentScans,
+          };
+        })
+      );
+
+      setBusSummaries(summaries.sort((a, b) => String(a.busNumber).localeCompare(String(b.busNumber), undefined, { numeric: true })));
+      setSelectedBusSummary(prev => prev ? summaries.find(bus => bus.id === prev.id) || prev : null);
+    } catch (err) {
+      const message = getFriendlyError(err, 'Failed to load bus summary');
+      setBusSummaryError(message);
+      showToast(message, 'error');
+    } finally {
+      if (showLoader) setBusSummaryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchBusSummaries(true);
+    const interval = setInterval(() => fetchBusSummaries(false), 30000);
+    return () => clearInterval(interval);
+  }, [fetchBusSummaries]);
 
   const fetchStaff = async () => {
     setStaffLoading(true);
@@ -235,15 +393,39 @@ export default function AdminBuses({ onBack, currentUser }) {
           </View>
         </View>
         <TouchableOpacity
-          onPress={openAddModal}
+          onPress={activeTab === 'manage' ? openAddModal : () => fetchBusSummaries(true)}
           style={{ backgroundColor: C.teal, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12, flexDirection: 'row', alignItems: 'center', gap: 6 }}
         >
-          <Text style={{ color: C.white, fontWeight: '700', fontSize: 13 }}>+ Add Bus</Text>
+          <Text style={{ color: C.white, fontWeight: '700', fontSize: 13 }}>{activeTab === 'manage' ? '+ Add Bus' : 'Refresh'}</Text>
         </TouchableOpacity>
       </View>
 
+      <View style={{ flexDirection: 'row', gap: 10, paddingHorizontal: 20, paddingBottom: 16 }}>
+        {[
+          { key: 'manage', label: 'Manage Buses' },
+          { key: 'summary', label: 'Bus Summary' },
+        ].map(tab => (
+          <TouchableOpacity
+            key={tab.key}
+            onPress={() => setActiveTab(tab.key)}
+            style={{
+              flex: 1,
+              backgroundColor: activeTab === tab.key ? C.teal : C.card,
+              borderRadius: 14,
+              borderWidth: 1,
+              borderColor: activeTab === tab.key ? C.teal : C.border,
+              paddingVertical: 12,
+              alignItems: 'center',
+            }}
+          >
+            <Text style={{ color: activeTab === tab.key ? C.white : C.muted, fontWeight: '700', fontSize: 13 }}>{tab.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
       {/* Bus List */}
-      {loading ? (
+      {activeTab === 'manage' ? (
+      loading ? (
         <ActivityIndicator size="large" color={C.teal} style={{ marginTop: 40 }} />
       ) : buses.length === 0 ? (
         <View style={{ alignItems: 'center', marginTop: 60, paddingHorizontal: 32 }}>
@@ -289,9 +471,137 @@ export default function AdminBuses({ onBack, currentUser }) {
           ))}
           <View style={{ height: 40 }} />
         </ScrollView>
+      )) : (
+        busSummaryLoading ? (
+          <View style={{ flex: 1, justifyContent: 'center', paddingHorizontal: 20 }}>
+            <LoadingSpinner message="Loading bus summary..." />
+          </View>
+        ) : busSummaryError ? (
+          <View style={{ marginHorizontal: 20, marginTop: 20, backgroundColor: C.card, borderRadius: 16, borderWidth: 1, borderColor: C.coral + '44', padding: 16 }}>
+            <Text style={{ color: C.coral, fontWeight: '700', fontSize: 13, marginBottom: 6 }}>Failed to load bus summary</Text>
+            <Text style={{ color: C.muted, fontSize: 12, lineHeight: 18, marginBottom: 12 }}>{busSummaryError}</Text>
+            <TouchableOpacity onPress={() => fetchBusSummaries(true)} style={{ alignSelf: 'flex-start', backgroundColor: C.coral + '22', borderWidth: 1, borderColor: C.coral + '44', borderRadius: 10, paddingVertical: 8, paddingHorizontal: 12 }}>
+              <Text style={{ color: C.coral, fontWeight: '700', fontSize: 12 }}>Retry</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <ScrollView style={{ paddingHorizontal: 20 }}>
+            <View style={{ backgroundColor: C.card, borderRadius: 16, borderWidth: 1, borderColor: C.border, overflow: 'hidden', marginBottom: 24 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 12, backgroundColor: C.navyMid, borderBottomWidth: 1, borderBottomColor: C.border }}>
+                <Text style={{ flex: 1.2, color: C.white, fontSize: 11, fontWeight: '700', textAlign: 'center' }}>Bus Number</Text>
+                <Text style={{ flex: 1, color: C.white, fontSize: 11, fontWeight: '700', textAlign: 'center' }}>Students Allotted</Text>
+                <Text style={{ flex: 1, color: C.white, fontSize: 11, fontWeight: '700', textAlign: 'center' }}>Boarded Today</Text>
+                <Text style={{ flex: 1, color: C.white, fontSize: 11, fontWeight: '700', textAlign: 'center' }}>Absent</Text>
+              </View>
+
+              {busSummaries.length === 0 ? (
+                <View style={{ padding: 24, alignItems: 'center' }}>
+                  <Text style={{ color: C.muted, fontSize: 13 }}>No buses found yet.</Text>
+                </View>
+              ) : (
+                <>
+                  {busSummaries.map((bus, index) => (
+                    <TouchableOpacity
+                      key={bus.id}
+                      onPress={() => setSelectedBusSummary(bus)}
+                      style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: index === busSummaries.length - 1 ? C.border : C.border }}
+                    >
+                      <Text style={{ flex: 1.2, color: C.white, fontSize: 12, fontWeight: '700', textAlign: 'center' }}>{bus.busNumber || '—'}</Text>
+                      <Text style={{ flex: 1, color: C.muted, fontSize: 12, textAlign: 'center' }}>{bus.studentsAllotted}</Text>
+                      <Text style={{ flex: 1, color: C.teal, fontSize: 12, fontWeight: '700', textAlign: 'center' }}>{bus.boardedToday}</Text>
+                      <Text style={{ flex: 1, color: C.coral, fontSize: 12, fontWeight: '700', textAlign: 'center' }}>{bus.absent}</Text>
+                    </TouchableOpacity>
+                  ))}
+                  <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 14, backgroundColor: C.navyMid, borderTopWidth: 1, borderTopColor: C.border }}>
+                    <Text style={{ flex: 1.2, color: C.white, fontSize: 12, fontWeight: '800', textAlign: 'center' }}>Total</Text>
+                    <Text style={{ flex: 1, color: C.white, fontSize: 12, fontWeight: '800', textAlign: 'center' }}>{busSummaries.reduce((sum, bus) => sum + bus.studentsAllotted, 0)}</Text>
+                    <Text style={{ flex: 1, color: C.teal, fontSize: 12, fontWeight: '800', textAlign: 'center' }}>{busSummaries.reduce((sum, bus) => sum + bus.boardedToday, 0)}</Text>
+                    <Text style={{ flex: 1, color: C.coral, fontSize: 12, fontWeight: '800', textAlign: 'center' }}>{busSummaries.reduce((sum, bus) => sum + bus.absent, 0)}</Text>
+                  </View>
+                </>
+              )}
+            </View>
+          </ScrollView>
+        )
       )}
 
       {/* ── ADD BUS MODAL ── */}
+      <Modal visible={!!selectedBusSummary} transparent animationType="slide" onRequestClose={() => setSelectedBusSummary(null)}>
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.72)', justifyContent: 'flex-end' }}>
+          <View style={{ backgroundColor: C.navy, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 20, maxHeight: '84%', borderWidth: 1, borderColor: C.border, borderBottomWidth: 0 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={{ color: C.white, fontSize: 18, fontWeight: '800' }}>{'\uD83D\uDE8C'} {selectedBusSummary?.busNumber || 'Bus Detail'}</Text>
+                <Text style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>
+                  {selectedBusSummary ? `${selectedBusSummary.studentsAllotted} allotted · ${selectedBusSummary.boardedToday} boarded · ${selectedBusSummary.absent} absent` : ''}
+                </Text>
+              </View>
+              <TouchableOpacity onPress={() => setSelectedBusSummary(null)} style={{ width: 34, height: 34, borderRadius: 10, backgroundColor: C.card, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' }}>
+                <Text style={{ color: C.muted, fontSize: 18 }}>{'\u2715'}</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <View style={{ marginBottom: 18 }}>
+                <Text style={{ color: C.white, fontSize: 15, fontWeight: '700', marginBottom: 10 }}>{'\u2705'} Boarded</Text>
+                {selectedBusSummary?.boardedStudents.length ? selectedBusSummary.boardedStudents.map((student) => (
+                  <View key={`boarded-${student.studentId}`} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8, gap: 10 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.white, fontSize: 13, fontWeight: '700' }}>{student.studentName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{student.className}</Text>
+                    </View>
+                    <Text style={{ color: C.teal, fontSize: 11, fontWeight: '700' }}>{formatScanTimestamp(student.scanTime)}</Text>
+                  </View>
+                )) : <Text style={{ color: C.muted, fontSize: 12, marginBottom: 4 }}>No boarded students yet.</Text>}
+              </View>
+
+              <View style={{ marginBottom: 18 }}>
+                <Text style={{ color: C.white, fontSize: 15, fontWeight: '700', marginBottom: 10 }}>{'\u274C'} Not Boarded</Text>
+                {selectedBusSummary?.notBoardedStudents.length ? selectedBusSummary.notBoardedStudents.map((student) => (
+                  <View key={`absent-${student.studentId}`} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.white, fontSize: 13, fontWeight: '700' }}>{student.studentName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{student.className}</Text>
+                    </View>
+                  </View>
+                )) : <Text style={{ color: C.muted, fontSize: 12, marginBottom: 4 }}>No absent students right now.</Text>}
+              </View>
+
+              <View style={{ marginBottom: 18 }}>
+                <Text style={{ color: C.white, fontSize: 15, fontWeight: '700', marginBottom: 10 }}>{'\uD83D\uDFE1'} On Leave</Text>
+                {selectedBusSummary?.onLeaveStudents.length ? selectedBusSummary.onLeaveStudents.map((student) => (
+                  <View key={`leave-${student.studentId}`} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8, gap: 10 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.white, fontSize: 13, fontWeight: '700' }}>{student.studentName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{student.className}</Text>
+                    </View>
+                    <View style={{ backgroundColor: C.gold + '22', borderRadius: 99, paddingVertical: 4, paddingHorizontal: 10, borderWidth: 1, borderColor: C.gold + '44' }}>
+                      <Text style={{ color: C.gold, fontSize: 11, fontWeight: '700' }}>Skip Stop</Text>
+                    </View>
+                  </View>
+                )) : <Text style={{ color: C.muted, fontSize: 12, marginBottom: 4 }}>No approved leave students today.</Text>}
+              </View>
+
+              <View style={{ marginBottom: 8 }}>
+                <Text style={{ color: C.white, fontSize: 15, fontWeight: '700', marginBottom: 10 }}>Recent Scans</Text>
+                {selectedBusSummary?.recentScans.length ? selectedBusSummary.recentScans.map((scan) => (
+                  <View key={`scan-${scan.id}`} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8, gap: 10 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: C.white, fontSize: 13, fontWeight: '700' }}>{scan.studentName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{scan.className}</Text>
+                    </View>
+                    <View style={{ alignItems: 'flex-end' }}>
+                      <Text style={{ color: scan.type === 'board' ? C.teal : C.gold, fontSize: 11, fontWeight: '700' }}>{scan.type === 'board' ? 'Boarded' : 'Arrived'}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{formatScanTimestamp(scan.timestamp)}</Text>
+                    </View>
+                  </View>
+                )) : <Text style={{ color: C.muted, fontSize: 12, marginBottom: 4 }}>No scans recorded today.</Text>}
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={showAddModal} transparent animationType="slide" onRequestClose={() => setShowAddModal(false)}>
         <View style={{ flex: 1, backgroundColor: '#000000aa', justifyContent: 'flex-end' }}>
           <View style={{ backgroundColor: C.navy, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, maxHeight: '92%' }}>

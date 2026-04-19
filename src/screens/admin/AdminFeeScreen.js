@@ -3,21 +3,158 @@ import { View, Text, TouchableOpacity, TextInput, ScrollView, Modal, StyleSheet,
 import { LinearGradient } from 'expo-linear-gradient';
 import { C } from '../../theme/colors';
 import Icon from '../../components/Icon';
-import { PAYMENT_MODES, DISCOUNT_TYPES } from '../../data/admin';
 import { INR, FEE_STATUS_COLOR } from '../../theme/styles';
 import { apiFetch } from '../../api/client';
 import Toast from '../../components/Toast';
 import { getFriendlyError } from '../../utils/errorMessages';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import { db } from '../../config';
+import { collection, doc, getDoc, getDocs, query, serverTimestamp, setDoc, where, writeBatch } from 'firebase/firestore';
 
 const ACADEMIC_YEARS = ['2024-2025', '2025-2026', '2026-2027'];
 const QUARTERS = ['1', '2', '3', '4'];
+const DEFAULT_SCHOOL_ID = 'school_001';
+const TERM_LIMIT = 4;
 const PAY_METHODS = [
   { key: 'cash', label: 'Cash' },
   { key: 'cheque', label: 'Cheque' },
   { key: 'upi', label: 'UPI' },
   { key: 'card', label: 'Card' },
 ];
+
+const termDefaults = (index, existing = {}) => ({
+  termId: existing.termId || `term_${index + 1}`,
+  termName: existing.termName || `Term ${index + 1}`,
+  amount: existing.amount !== undefined ? String(existing.amount) : '',
+  dueDate: existing.dueDate || '',
+  quarter: existing.quarter || index + 1,
+});
+
+const ensureTermRows = (count, previous = []) => {
+  const safeCount = Math.max(1, Math.min(TERM_LIMIT, Number(count) || 1));
+  return Array.from({ length: safeCount }, (_, index) => termDefaults(index, previous[index]));
+};
+
+const sumHistoryPaid = (record) => {
+  if (!Array.isArray(record?.history)) return 0;
+  return record.history.reduce((sum, item) => sum + (Number(item?.amount) || 0), 0);
+};
+
+const formatStudentName = (record) => record?.studentName || record?.name || 'Student';
+const formatClassName = (record) => record?.className || record?.grade || record?.classId || 'Class';
+
+const getGrossAmount = (record) => Number(record?.totalAmount ?? record?.totalFee ?? record?.grossAmount ?? record?.netAmount) || 0;
+const getPaidAmount = (record) => Number(record?.paid ?? record?.amountPaid) || sumHistoryPaid(record);
+const getDiscountAmount = (record) => {
+  const explicit = Number(record?.discount ?? record?.discountAmount);
+  if (explicit > 0) return explicit;
+  const gross = getGrossAmount(record);
+  const net = Number(record?.netAmount);
+  if (gross > 0 && Number.isFinite(net) && net >= 0 && gross >= net) return gross - net;
+  return 0;
+};
+const getNetAmount = (record) => {
+  const stored = Number(record?.netAmount);
+  if (Number.isFinite(stored) && stored >= 0) return stored;
+  return Math.max(0, getGrossAmount(record) - getDiscountAmount(record));
+};
+const getBalance = (record) => Math.max(getNetAmount(record) - getPaidAmount(record) + (Number(record?.fine) || 0), 0);
+
+const normalizeFeeStatus = (record) => {
+  const raw = String(record?.status || '').toLowerCase();
+  const paid = getPaidAmount(record);
+  const balance = getBalance(record);
+  if (raw === 'overdue') return 'Overdue';
+  if (balance <= 0 && getNetAmount(record) > 0) return 'Cleared';
+  if (raw === 'partial') return 'Partial';
+  if (paid > 0 && balance > 0) return 'Partial';
+  if (raw === 'paid' || raw === 'cleared') return 'Cleared';
+  return 'Pending';
+};
+
+const normalizeFeeRecord = (record) => {
+  const gross = getGrossAmount(record);
+  const paid = getPaidAmount(record);
+  const discount = getDiscountAmount(record);
+  const net = getNetAmount(record);
+  const fine = Number(record?.fine) || 0;
+  return {
+    ...record,
+    studentName: formatStudentName(record),
+    name: formatStudentName(record),
+    className: formatClassName(record),
+    totalFee: gross,
+    totalAmount: gross,
+    discount,
+    netAmount: net,
+    paid,
+    amountPaid: paid,
+    fine,
+    balance: Math.max(net - paid + fine, 0),
+    status: normalizeFeeStatus(record),
+    quarter: Number(record?.quarter) || Number(record?.termNumber) || Number(record?.termIndex) || 1,
+    termName: record?.termName || (record?.quarter ? `Term ${record.quarter}` : 'Term 1'),
+  };
+};
+
+const aggregateStudentRecords = (records, seed = {}) => {
+  const normalized = (records || [])
+    .map(normalizeFeeRecord)
+    .sort((a, b) => (Number(a.quarter) || 0) - (Number(b.quarter) || 0));
+
+  if (!normalized.length) return { ...seed, records: [] };
+
+  const gross = normalized.reduce((sum, record) => sum + getGrossAmount(record), 0);
+  const discount = normalized.reduce((sum, record) => sum + getDiscountAmount(record), 0);
+  const net = normalized.reduce((sum, record) => sum + getNetAmount(record), 0);
+  const paid = normalized.reduce((sum, record) => sum + getPaidAmount(record), 0);
+  const fine = normalized.reduce((sum, record) => sum + (Number(record?.fine) || 0), 0);
+  const balance = normalized.reduce((sum, record) => sum + getBalance(record), 0);
+  const nextOpenRecord = normalized.find((record) => getBalance(record) > 0) || normalized[normalized.length - 1];
+  const quarterStatusMap = {};
+
+  normalized.forEach((record) => {
+    const key = String(record.quarter || 1);
+    const status = String(record.status || '').toLowerCase();
+    if (status === 'cleared' || status === 'paid') quarterStatusMap[key] = 'paid';
+    else if (status === 'overdue') quarterStatusMap[key] = 'overdue';
+    else quarterStatusMap[key] = 'pending';
+  });
+
+  const status = balance <= 0 && net > 0
+    ? 'Cleared'
+    : normalized.some((record) => record.status === 'Overdue')
+      ? 'Overdue'
+      : paid > 0
+        ? 'Partial'
+        : 'Pending';
+
+  return {
+    ...normalized[0],
+    ...seed,
+    id: seed.id || normalized[0].studentId || normalized[0].id,
+    studentId: seed.studentId || normalized[0].studentId || normalized[0].id,
+    studentName: seed.studentName || formatStudentName(normalized[0]),
+    name: seed.name || formatStudentName(normalized[0]),
+    classId: seed.classId || normalized[0].classId,
+    className: seed.className || formatClassName(normalized[0]),
+    totalFee: gross,
+    totalAmount: gross,
+    netAmount: net,
+    discount,
+    fine,
+    paid,
+    amountPaid: paid,
+    balance,
+    status,
+    quarter: nextOpenRecord?.quarter || 1,
+    termName: nextOpenRecord?.termName || `Term ${nextOpenRecord?.quarter || 1}`,
+    academicYear: nextOpenRecord?.academicYear || normalized[0].academicYear,
+    dueDate: nextOpenRecord?.dueDate || '',
+    quarterStatusMap,
+    records: normalized,
+  };
+};
 
 function QPill({ label, status }) {
   const colorMap = { paid: '#34D399', overdue: C.coral, pending: C.gold, upcoming: C.muted };
@@ -123,10 +260,6 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
   const [confirmingPay, setConfirmingPay] = useState(false);
   const [receiptData, setReceiptData] = useState(null);
 
-  const [newDiscType, setNewDiscType] = useState(DISCOUNT_TYPES[0]);
-  const [newDiscAmt, setNewDiscAmt] = useState('');
-  const [discTypeOpen, setDiscTypeOpen] = useState(false);
-
   const [transactions, setTransactions] = useState([]);
   const [txLoading, setTxLoading] = useState(false);
 
@@ -135,16 +268,21 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
   const [availableClasses, setAvailableClasses] = useState([]);
   const [structClassId, setStructClassId] = useState('');
   const [structClassName, setStructClassName] = useState('');
+  const [structYear, setStructYear] = useState('2025-2026');
+  const [structTermCount, setStructTermCount] = useState('3');
+  const [structTerms, setStructTerms] = useState(ensureTermRows(3));
   const [structTuition, setStructTuition] = useState('');
   const [structBus, setStructBus] = useState('');
   const [structMisc, setStructMisc] = useState('');
   const [structDueDay, setStructDueDay] = useState('10');
-  const [structYear, setStructYear] = useState('2025-2026');
   const [structSaving, setStructSaving] = useState(false);
   const [structSaved, setStructSaved] = useState(false);
+  const [structError, setStructError] = useState('');
+  const [structAssignedMessage, setStructAssignedMessage] = useState('');
+  const [feeStructures, setFeeStructures] = useState([]);
+  const [structuresLoading, setStructuresLoading] = useState(false);
   const [classDropOpen, setClassDropOpen] = useState(false);
   const [yearDropOpen, setYearDropOpen] = useState(false);
-
   const [genQuarter, setGenQuarter] = useState('1');
   const [genLoading, setGenLoading] = useState(false);
   const [quarterDropOpen, setQuarterDropOpen] = useState(false);
@@ -166,6 +304,65 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
   const [discSaving, setDiscSaving] = useState(false);
   const [discTypeDropOpen, setDiscTypeDropOpen] = useState(false);
   const [discStudentSearchResults, setDiscStudentSearchResults] = useState([]);
+  const [targetYear, setTargetYear] = useState('2025-2026');
+  const [targetYearDropOpen, setTargetYearDropOpen] = useState(false);
+  const [detailDiscType, setDetailDiscType] = useState('fixed');
+  const [detailDiscValue, setDetailDiscValue] = useState('');
+  const [detailDiscReason, setDetailDiscReason] = useState('');
+  const [detailDiscountSaving, setDetailDiscountSaving] = useState(false);
+  const [detailDiscountLoading, setDetailDiscountLoading] = useState(false);
+  const [detailDiscountMeta, setDetailDiscountMeta] = useState(null);
+
+  const schoolId = currentUser?.schoolId || DEFAULT_SCHOOL_ID;
+
+  const loadFeeStudentsData = async ({ showLoader = false } = {}) => {
+    if (showLoader) setLoading(true);
+    try {
+      const res = await apiFetch('/fee-students', {});
+      const data = await res.json();
+      if (data.success && Array.isArray(data.students)) {
+        setStudents(data.students.map(normalizeFeeRecord));
+      } else {
+        setStudents([]);
+      }
+    } catch (e) {
+      showToast(getFriendlyError(e, 'Failed to load fee records'), 'error');
+    } finally {
+      if (showLoader) setLoading(false);
+    }
+  };
+
+  const loadAvailableClasses = async () => {
+    try {
+      const response = await apiFetch('/available-classes');
+      const data = await response.json();
+      const classes = data.allClasses || data.classes || [];
+      setAvailableClasses(classes.map((item) => ({
+        id: item.id || item.classId || item.name,
+        name: item.name || item.className || item.id || item.classId,
+        classId: item.classId || item.id || item.name,
+        className: item.className || item.name || item.id || item.classId,
+      })));
+    } catch (_) {}
+  };
+
+  const loadFeeStructures = async () => {
+    setStructuresLoading(true);
+    setStructError('');
+    try {
+      const response = await apiFetch('/fee/structure');
+      const data = await response.json();
+      if (response.ok && data.success) {
+        setFeeStructures(data.structures || []);
+      } else {
+        setFeeStructures([]);
+      }
+    } catch (e) {
+      setStructError(getFriendlyError(e, 'Failed to load fee structures'));
+    } finally {
+      setStructuresLoading(false);
+    }
+  };
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -179,15 +376,11 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
 
   useEffect(() => {
     (async () => {
-      try {
-        const res = await apiFetch('/fee-students', {});
-        const data = await res.json();
-        if (data.success && Array.isArray(data.students)) setStudents(data.students);
-      } catch (e) {
-        console.log('Fee students fetch:', e.message);
-      } finally {
-        setLoading(false);
-      }
+      await Promise.all([
+        loadFeeStudentsData({ showLoader: true }),
+        loadAvailableClasses(),
+        loadFeeStructures(),
+      ]);
     })();
   }, []);
 
@@ -207,11 +400,42 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
   }, [detail]);
 
   useEffect(() => {
-    if (activeTab === 'settings' || activeTab === 'classes') {
-      apiFetch('/available-classes').then(r => r.json()).then(data => { if (data.classes) setAvailableClasses(data.classes); }).catch(() => {});
-    }
     if (activeTab === 'reports') loadReport(rptYear, rptQuarter);
   }, [activeTab]);
+
+  useEffect(() => {
+    if (!detail) {
+      setDetailDiscountMeta(null);
+      setDetailDiscType('fixed');
+      setDetailDiscValue('');
+      setDetailDiscReason('');
+      return;
+    }
+
+    const sid = detail.studentId || detail.id;
+    if (!sid) return;
+
+    setDetailDiscountLoading(true);
+    apiFetch(`/fee/discount/${encodeURIComponent(sid)}`)
+      .then((response) => response.json())
+      .then((data) => {
+        const discount = data?.discount || null;
+        setDetailDiscountMeta(discount);
+        if (discount) {
+          setDetailDiscType(discount.discountType === 'percentage' ? 'percentage' : 'fixed');
+          setDetailDiscValue(discount.discountValue ? String(discount.discountValue) : '');
+          setDetailDiscReason(discount.reason || '');
+        } else {
+          setDetailDiscType('fixed');
+          setDetailDiscValue('');
+          setDetailDiscReason('');
+        }
+      })
+      .catch(() => {
+        setDetailDiscountMeta(null);
+      })
+      .finally(() => setDetailDiscountLoading(false));
+  }, [detail]);
 
   useEffect(() => {
     if (discStudentSearch.length > 1) {
@@ -227,8 +451,33 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
     }
   }, [discStudentSearch, students]);
 
+  const rebuildDetailState = (records, currentDetail) => {
+    if (!records.length) return currentDetail;
+    if (Array.isArray(currentDetail?.records) && currentDetail.records.length) {
+      return aggregateStudentRecords(records, {
+        studentId: currentDetail.studentId || currentDetail.id,
+        studentName: currentDetail.studentName || currentDetail.name,
+        classId: currentDetail.classId,
+        className: currentDetail.className,
+      });
+    }
+    return normalizeFeeRecord(records[0]);
+  };
+
+  const commitBatchedSets = async (writes) => {
+    for (let start = 0; start < writes.length; start += 350) {
+      const batch = writeBatch(db);
+      writes.slice(start, start + 350).forEach(({ ref, data, options = { merge: true } }) => {
+        batch.set(ref, data, options);
+      });
+      await batch.commit();
+    }
+  };
+
   const openPayModal = () => {
-    const amt = detail?.netAmount || detail?.totalFee || '';
+    const detailRecords = Array.isArray(detail?.records) && detail.records.length ? detail.records : detail ? [detail] : [];
+    const activeRecord = detailRecords.find((record) => getBalance(record) > 0) || detailRecords[0] || detail;
+    const amt = activeRecord ? getBalance(activeRecord) : '';
     setPayAmount(amt ? String(amt) : '');
     setPayMethod('cash');
     setPayReceiptNo('');
@@ -240,9 +489,11 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
 
   const confirmPayment = async () => {
     if (!payAmount || isNaN(+payAmount) || +payAmount <= 0) { showToast('Enter a valid amount', 'error'); return; }
-    const studentId = detail?.studentId || detail?.id;
-    const academicYear = detail?.academicYear || '2025-2026';
-    const quarter = detail?.quarter || '1';
+    const detailRecords = Array.isArray(detail?.records) && detail.records.length ? detail.records : detail ? [detail] : [];
+    const activeRecord = detailRecords.find((record) => getBalance(record) > 0) || detailRecords[0] || detail;
+    const studentId = activeRecord?.studentId || detail?.studentId || detail?.id;
+    const academicYear = activeRecord?.academicYear || detail?.academicYear || '2025-2026';
+    const quarter = activeRecord?.quarter || detail?.quarter || '1';
     if (!studentId) { showToast('Student ID missing', 'error'); return; }
 
     setConfirmingPay(true);
@@ -262,8 +513,47 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
 
       if (res.ok && data.success) {
         const rn = data.receiptNumber;
-        setStudents(p => p.map(s => (s.id === detail.id || s.studentId === studentId) ? { ...s, status: 'paid', paid: Number(payAmount) } : s));
-        setDetail(prev => ({ ...prev, status: 'paid', paid: Number(payAmount) }));
+        const nextStudents = students.map((record) => {
+          const sameRecord = record.id === activeRecord?.id
+            || (
+              (record.studentId || record.id) === studentId
+              && String(record.academicYear || '') === String(academicYear || '')
+              && String(record.quarter || '') === String(quarter || '')
+            );
+          if (!sameRecord) return record;
+          return normalizeFeeRecord({
+            ...record,
+            status: 'paid',
+            paid: getPaidAmount(record) + Number(payAmount),
+            amountPaid: getPaidAmount(record) + Number(payAmount),
+            paidAt: new Date().toISOString(),
+            paymentMethod: payMethod,
+            receiptNumber: rn,
+          });
+        });
+        setStudents(nextStudents);
+
+        if (detail) {
+          const updatedDetailRecords = detailRecords.map((record) => {
+            const sameRecord = record.id === activeRecord?.id
+              || (
+                (record.studentId || record.id) === studentId
+                && String(record.academicYear || '') === String(academicYear || '')
+                && String(record.quarter || '') === String(quarter || '')
+              );
+            if (!sameRecord) return normalizeFeeRecord(record);
+            return normalizeFeeRecord({
+              ...record,
+              status: 'paid',
+              paid: getPaidAmount(record) + Number(payAmount),
+              amountPaid: getPaidAmount(record) + Number(payAmount),
+              paidAt: new Date().toISOString(),
+              paymentMethod: payMethod,
+              receiptNumber: rn,
+            });
+          });
+          setDetail(rebuildDetailState(updatedDetailRecords, detail));
+        }
         setPayModal(false);
         showToast(`Payment recorded! Receipt: ${rn}`);
         setReceiptData({
@@ -293,7 +583,9 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
 
   const sendFeeNotification = async () => {
     if (!detail) return;
-    const balance = Math.max(0, (detail.totalFee || 0) - (detail.paid || 0) - (detail.discount || 0) + (detail.fine || 0));
+    const balance = Array.isArray(detail.records) && detail.records.length
+      ? detail.records.reduce((sum, record) => sum + getBalance(record), 0)
+      : getBalance(detail);
     if (balance <= 0) { showToast('No pending balance', 'error'); return; }
     const dueDate = notifyDueDate || new Date(Date.now() + 7 * 86400000).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
     setNotifySending(true);
@@ -301,9 +593,9 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
       const res = await apiFetch('/fee-reminder', {
         method: 'POST',
         body: JSON.stringify({
-          studentId: `student-${detail.id}`,
+          studentId: detail.studentId || detail.id,
           studentName: detail.name || detail.studentName,
-          className: `Grade ${detail.grade}`,
+          className: detail.className || detail.grade || detail.classId,
           amount: balance,
           dueDate,
           message: notifyMsg || `Dear Parent, a fee balance of ${INR(balance)} is pending. Please pay by ${dueDate}.`,
@@ -320,41 +612,286 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
     setNotifySending(false);
   };
 
-  const addDiscount = () => {
-    if (!newDiscAmt || isNaN(+newDiscAmt) || +newDiscAmt <= 0) return;
-    const disc = { type: newDiscType, amount: +newDiscAmt };
-    setStudents(p => p.map(s => s.id === detail.id ? { ...s, discount: (s.discount || 0) + (+newDiscAmt), discounts: [...(s.discounts || []), disc] } : s));
-    setDetail(prev => ({ ...prev, discount: (prev.discount || 0) + (+newDiscAmt), discounts: [...(prev.discounts || []), disc] }));
-    setNewDiscType(DISCOUNT_TYPES[0]); setNewDiscAmt('');
-    setDiscModal(false); showToast('Discount applied');
-  };
-
   const saveStructure = async () => {
-    if (!structClassId || !structTuition || !structYear) { showToast('Class, tuition fee and academic year are required', 'error'); return; }
+    if (!structClassId || !structYear) {
+      const msg = 'Class and academic year are required';
+      setStructError(msg);
+      showToast(msg, 'error');
+      return;
+    }
+
+    const parsedTerms = ensureTermRows(structTermCount, structTerms).map((term, index) => ({
+      termId: term.termId || `term_${index + 1}`,
+      termName: (term.termName || `Term ${index + 1}`).trim(),
+      amount: Number(term.amount) || 0,
+      dueDate: (term.dueDate || '').trim(),
+      quarter: index + 1,
+    }));
+
+    const invalidTerm = parsedTerms.find((term) => !term.termName || term.amount <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(term.dueDate));
+    if (invalidTerm) {
+      const msg = 'Each term needs a name, amount, and due date in YYYY-MM-DD format';
+      setStructError(msg);
+      showToast(msg, 'error');
+      return;
+    }
+
     setStructSaving(true);
+    setStructError('');
+    setStructAssignedMessage('');
     try {
-      const res = await apiFetch('/fee/structure/save', {
-        method: 'POST',
-        body: JSON.stringify({ classId: structClassId, className: structClassName, tuitionFee: Number(structTuition), busFee: Number(structBus) || 0, miscFee: Number(structMisc) || 0, dueDay: Number(structDueDay) || 10, academicYear: structYear }),
+      const studentsResponse = await apiFetch(`/students/${encodeURIComponent(structClassId)}`);
+      const studentsData = await studentsResponse.json();
+      if (!studentsResponse.ok || studentsData.success === false) {
+        throw new Error(studentsData.error || 'Failed to load students for this class');
+      }
+
+      const studentsInClass = studentsData.students || [];
+      if (!studentsInClass.length) {
+        throw new Error('No students found in this class');
+      }
+
+      const resolvedClassName = structClassName || studentsInClass[0]?.className || structClassId;
+      const structureId = `${schoolId}_${structClassId}_${structYear}`;
+      const totalTarget = parsedTerms.reduce((sum, term) => sum + term.amount, 0);
+
+      await setDoc(doc(db, 'fee_structure', structureId), {
+        structureId,
+        schoolId,
+        classId: structClassId,
+        className: resolvedClassName,
+        academicYear: structYear,
+        termCount: parsedTerms.length,
+        terms: parsedTerms,
+        totalTarget,
+        updatedAt: serverTimestamp(),
+        updatedBy: currentUser?.role_id || currentUser?.id || 'admin',
+      }, { merge: true });
+
+      const existingRecordMap = {};
+      students.forEach((record) => {
+        existingRecordMap[record.id] = record;
       });
-      const data = await res.json();
-      if (res.ok && data.success) { showToast('Fee structure saved'); setStructSaved(true); }
-      else showToast(data.error || 'Failed to save', 'error');
-    } catch (e) { showToast(getFriendlyError(e, 'Network error'), 'error'); }
+
+      const discountEntries = await Promise.all(
+        studentsInClass.map(async (student) => {
+          const sid = student.studentId || student.id;
+          try {
+            const discountSnap = await getDoc(doc(db, 'fee_discounts', `${schoolId}_${sid}`));
+            return [sid, discountSnap.exists() ? discountSnap.data() : null];
+          } catch (_) {
+            return [sid, null];
+          }
+        })
+      );
+      const discountMap = Object.fromEntries(discountEntries);
+
+      const writes = [];
+      parsedTerms.forEach((term) => {
+        studentsInClass.forEach((student) => {
+          const sid = student.studentId || student.id;
+          const recordId = `${schoolId}_${sid}_${structYear}_Q${term.quarter}`;
+          const existing = existingRecordMap[recordId];
+          const discountMeta = discountMap[sid];
+
+          let discountAmount = 0;
+          if (discountMeta?.discountType === 'percentage') {
+            discountAmount = Math.round((term.amount * (Number(discountMeta.discountValue) || 0)) / 100);
+          } else if (discountMeta?.discountType === 'fixed') {
+            discountAmount = Number(discountMeta.discountValue) || 0;
+          } else if (discountMeta?.discountType === 'waiver') {
+            discountAmount = term.amount;
+          }
+
+          const netAmount = Math.max(0, term.amount - discountAmount);
+          const paidAmount = existing ? getPaidAmount(existing) : 0;
+          const fineAmount = Number(existing?.fine) || 0;
+          const status = normalizeFeeStatus({
+            ...existing,
+            totalAmount: term.amount,
+            totalFee: term.amount,
+            netAmount,
+            paid: paidAmount,
+            amountPaid: paidAmount,
+            fine: fineAmount,
+            status: existing?.status || 'pending',
+          });
+
+          const payload = {
+            recordId,
+            studentId: sid,
+            studentName: student.name || student.full_name || student.studentName || '',
+            classId: structClassId,
+            className: resolvedClassName,
+            schoolId,
+            academicYear: structYear,
+            quarter: term.quarter,
+            termName: term.termName,
+            termNumber: term.quarter,
+            totalAmount: term.amount,
+            totalFee: term.amount,
+            discount: discountAmount,
+            discountType: discountMeta?.discountType || null,
+            discountValue: discountMeta ? Number(discountMeta.discountValue) || 0 : 0,
+            discountReason: discountMeta?.reason || '',
+            netAmount,
+            paid: paidAmount,
+            amountPaid: paidAmount,
+            fine: fineAmount,
+            dueDate: term.dueDate,
+            status,
+            updatedAt: serverTimestamp(),
+          };
+
+          if (!existing) payload.createdAt = serverTimestamp();
+
+          writes.push({
+            ref: doc(db, 'fee_records', recordId),
+            data: payload,
+            options: { merge: true },
+          });
+        });
+      });
+
+      await commitBatchedSets(writes);
+      await Promise.all([loadFeeStudentsData(), loadFeeStructures()]);
+
+      const message = `Fee structure assigned to ${studentsInClass.length} students in ${resolvedClassName}`;
+      setStructAssignedMessage(message);
+      showToast(message);
+    } catch (e) {
+      const msg = getFriendlyError(e, 'Failed to create fee structure');
+      setStructError(msg);
+      showToast(msg, 'error');
+    }
     setStructSaving(false);
   };
 
-  const generateRecords = async () => {
-    if (!structClassId || !structYear || !genQuarter) { showToast('Select class, year and quarter', 'error'); return; }
-    setGenLoading(true);
+  const saveDetailDiscount = async () => {
+    if (!detail) return;
+    if (!detailDiscValue || isNaN(+detailDiscValue) || +detailDiscValue <= 0) {
+      showToast('Enter a valid discount value', 'error');
+      return;
+    }
+
+    const studentId = detail.studentId || detail.id;
+    if (!studentId) {
+      showToast('Student ID missing', 'error');
+      return;
+    }
+
+    setDetailDiscountSaving(true);
     try {
-      const res = await apiFetch('/fee/generate-records', { method: 'POST', body: JSON.stringify({ classId: structClassId, academicYear: structYear, quarter: genQuarter }) });
-      const data = await res.json();
-      if (res.ok && data.success) { showToast(`Fee records created for ${data.recordsCreated} students`); setStructSaved(false); }
-      else showToast(data.error || 'Failed to generate', 'error');
-    } catch (e) { showToast(getFriendlyError(e, 'Network error'), 'error'); }
-    setGenLoading(false);
+      const response = await apiFetch('/fee/discount/save', {
+        method: 'POST',
+        body: JSON.stringify({
+          studentId,
+          discountType: detailDiscType,
+          discountValue: Number(detailDiscValue),
+          reason: detailDiscReason,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Failed to save discount');
+      }
+
+      const detailRecords = Array.isArray(detail.records) && detail.records.length ? detail.records : [detail];
+      const targetAcademicYears = new Set(detailRecords.map((record) => record.academicYear).filter(Boolean));
+      const recordsToUpdate = students.filter((record) => {
+        const sid = record.studentId || record.id;
+        return sid === studentId && (!targetAcademicYears.size || targetAcademicYears.has(record.academicYear));
+      });
+
+      const writes = recordsToUpdate.map((record) => {
+        const gross = getGrossAmount(record);
+        const discountAmount = detailDiscType === 'percentage'
+          ? Math.round((gross * Number(detailDiscValue)) / 100)
+          : Number(detailDiscValue);
+        const netAmount = Math.max(0, gross - discountAmount);
+        const paidAmount = getPaidAmount(record);
+        const fineAmount = Number(record.fine) || 0;
+
+        return {
+          ref: doc(db, 'fee_records', record.id),
+          data: {
+            discount: discountAmount,
+            discountType: detailDiscType,
+            discountValue: Number(detailDiscValue),
+            discountReason: detailDiscReason,
+            netAmount,
+            paid: paidAmount,
+            amountPaid: paidAmount,
+            status: normalizeFeeStatus({
+              ...record,
+              discount: discountAmount,
+              netAmount,
+              paid: paidAmount,
+              amountPaid: paidAmount,
+              fine: fineAmount,
+            }),
+            updatedAt: serverTimestamp(),
+          },
+          options: { merge: true },
+        };
+      });
+
+      if (writes.length) {
+        await commitBatchedSets(writes);
+      }
+
+      const nextStudents = students.map((record) => {
+        const sameStudent = (record.studentId || record.id) === studentId
+          && (!targetAcademicYears.size || targetAcademicYears.has(record.academicYear));
+        if (!sameStudent) return record;
+
+        const gross = getGrossAmount(record);
+        const discountAmount = detailDiscType === 'percentage'
+          ? Math.round((gross * Number(detailDiscValue)) / 100)
+          : Number(detailDiscValue);
+
+        return normalizeFeeRecord({
+          ...record,
+          discount: discountAmount,
+          discountType: detailDiscType,
+          discountValue: Number(detailDiscValue),
+          discountReason: detailDiscReason,
+          netAmount: Math.max(0, gross - discountAmount),
+        });
+      });
+      setStudents(nextStudents);
+
+      const updatedDetailRecords = detailRecords.map((record) => {
+        const gross = getGrossAmount(record);
+        const discountAmount = detailDiscType === 'percentage'
+          ? Math.round((gross * Number(detailDiscValue)) / 100)
+          : Number(detailDiscValue);
+        return normalizeFeeRecord({
+          ...record,
+          discount: discountAmount,
+          discountType: detailDiscType,
+          discountValue: Number(detailDiscValue),
+          discountReason: detailDiscReason,
+          netAmount: Math.max(0, gross - discountAmount),
+        });
+      });
+
+      setDetail(rebuildDetailState(updatedDetailRecords, detail));
+      setDetailDiscountMeta({
+        studentId,
+        discountType: detailDiscType,
+        discountValue: Number(detailDiscValue),
+        reason: detailDiscReason,
+      });
+      setDiscModal(false);
+      showToast('Discount saved and applied to this student profile');
+    } catch (e) {
+      showToast(getFriendlyError(e, 'Failed to save discount'), 'error');
+    }
+    setDetailDiscountSaving(false);
   };
+
+  const generateRecords = async () => {};
 
   const saveDiscount = async () => {
     if (!discSelectedStudent) { showToast('Select a student first', 'error'); return; }
@@ -365,6 +902,55 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
       const res = await apiFetch('/fee/discount/save', { method: 'POST', body: JSON.stringify({ studentId, discountType: discType, discountValue: discType === 'waiver' ? 0 : Number(discValue), reason: discReason }) });
       const data = await res.json();
       if (res.ok && data.success) {
+        const matchedRecords = students.filter((record) => (record.studentId || record.id) === studentId);
+        const writes = matchedRecords.map((record) => {
+          const gross = getGrossAmount(record);
+          let discountAmount = 0;
+          if (discType === 'percentage') discountAmount = Math.round((gross * Number(discValue || 0)) / 100);
+          else if (discType === 'fixed') discountAmount = Number(discValue || 0);
+          else if (discType === 'waiver') discountAmount = gross;
+
+          return {
+            ref: doc(db, 'fee_records', record.id),
+            data: {
+              discount: discountAmount,
+              discountType: discType,
+              discountValue: discType === 'waiver' ? 0 : Number(discValue || 0),
+              discountReason: discReason,
+              netAmount: Math.max(0, gross - discountAmount),
+              paid: getPaidAmount(record),
+              amountPaid: getPaidAmount(record),
+              status: normalizeFeeStatus({
+                ...record,
+                discount: discountAmount,
+                netAmount: Math.max(0, gross - discountAmount),
+                paid: getPaidAmount(record),
+                amountPaid: getPaidAmount(record),
+              }),
+              updatedAt: serverTimestamp(),
+            },
+            options: { merge: true },
+          };
+        });
+        if (writes.length) await commitBatchedSets(writes);
+
+        const nextStudents = students.map((record) => {
+          if ((record.studentId || record.id) !== studentId) return record;
+          const gross = getGrossAmount(record);
+          let discountAmount = 0;
+          if (discType === 'percentage') discountAmount = Math.round((gross * Number(discValue || 0)) / 100);
+          else if (discType === 'fixed') discountAmount = Number(discValue || 0);
+          else if (discType === 'waiver') discountAmount = gross;
+          return normalizeFeeRecord({
+            ...record,
+            discount: discountAmount,
+            discountType: discType,
+            discountValue: discType === 'waiver' ? 0 : Number(discValue || 0),
+            discountReason: discReason,
+            netAmount: Math.max(0, gross - discountAmount),
+          });
+        });
+        setStudents(nextStudents);
         showToast(`Discount saved for ${discSelectedStudent.studentName || discSelectedStudent.name || 'Student'}`);
         setDiscSelectedStudent(null); setDiscStudentSearch(''); setDiscValue(''); setDiscReason(''); setDiscType('percentage');
       } else showToast(data.error || 'Failed to save discount', 'error');
@@ -469,30 +1055,107 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
   };
 
   const classesByGroup = useMemo(() => {
-    const unique = {};
-    students.forEach(s => {
-      const cid = s.classId || s.grade || 'Unknown';
-      const cname = s.className || `Grade ${s.grade}` || cid;
-      if (!unique[cid]) unique[cid] = { classId: cid, className: cname, students: [] };
-      const key = s.studentId || s.id;
-      if (!unique[cid].students.find(x => (x.studentId || x.id) === key)) unique[cid].students.push(s);
+    const grouped = {};
+    students.forEach((record) => {
+      const classId = record.classId || record.grade || 'Unknown';
+      const className = record.className || (record.grade ? `Grade ${record.grade}` : classId);
+      const studentId = record.studentId || record.id;
+      if (!grouped[classId]) grouped[classId] = { classId, className, studentMap: {} };
+      if (!grouped[classId].studentMap[studentId]) grouped[classId].studentMap[studentId] = [];
+      grouped[classId].studentMap[studentId].push(record);
     });
-    return Object.values(unique);
+
+    return Object.values(grouped)
+      .map((group) => ({
+        classId: group.classId,
+        className: group.className,
+        students: Object.values(group.studentMap)
+          .map((records) => aggregateStudentRecords(records, { classId: group.classId, className: group.className }))
+          .sort((a, b) => (a.studentName || '').localeCompare(b.studentName || '', undefined, { sensitivity: 'base' })),
+      }))
+      .sort((a, b) => (a.className || '').localeCompare(b.className || '', undefined, { numeric: true }));
   }, [students]);
 
   const classStudents = useMemo(() => {
     if (!selectedClass) return [];
-    return students.filter(s => (s.classId || s.grade) === selectedClass.classId);
+    const grouped = {};
+    students
+      .filter((record) => (record.classId || record.grade) === selectedClass.classId)
+      .forEach((record) => {
+        const studentId = record.studentId || record.id;
+        if (!grouped[studentId]) grouped[studentId] = [];
+        grouped[studentId].push(record);
+      });
+
+    return Object.values(grouped)
+      .map((records) => aggregateStudentRecords(records, {
+        classId: selectedClass.classId,
+        className: selectedClass.className,
+      }))
+      .sort((a, b) => (a.studentName || '').localeCompare(b.studentName || '', undefined, { sensitivity: 'base' }));
   }, [students, selectedClass]);
 
   const filteredStudents = students
     .filter(s => filter === 'All' || s.status === filter)
-    .filter(s => (s.name || s.studentName || '').toLowerCase().includes(search.toLowerCase()) || (s.grade || '').includes(search));
+    .filter(s => (s.name || s.studentName || '').toLowerCase().includes(search.toLowerCase()) || String(s.grade || s.className || '').toLowerCase().includes(search.toLowerCase()));
 
-  const totalFees = students.reduce((a, s) => a + (s.totalFee || s.netAmount || 0), 0);
-  const totalCollected = students.reduce((a, s) => a + (s.paid || 0), 0);
-  const totalPending = students.reduce((a, s) => a + Math.max(0, (s.totalFee || s.netAmount || 0) - (s.paid || 0) - (s.discount || 0) + (s.fine || 0)), 0);
+  const totalFees = students.reduce((sum, record) => sum + getNetAmount(record), 0);
+  const totalCollected = students.reduce((sum, record) => sum + getPaidAmount(record), 0);
+  const totalPending = students.reduce((sum, record) => sum + getBalance(record), 0);
   const collectedPct = Math.min(100, Math.round((totalCollected / (totalFees || 1)) * 100));
+  const currentStructurePreview = feeStructures.find((structure) => structure.classId === structClassId && structure.academicYear === structYear) || null;
+  const currentYearStructures = feeStructures
+    .filter((structure) => structure.academicYear === structYear)
+    .sort((a, b) => (a.className || '').localeCompare(b.className || '', undefined, { numeric: true }));
+  const targetRecords = students.filter((record) => (record.academicYear || '') === targetYear);
+  const targetTotal = targetRecords.reduce((sum, record) => sum + getNetAmount(record), 0);
+  const targetCollected = targetRecords.reduce((sum, record) => sum + getPaidAmount(record), 0);
+  const targetPending = targetRecords.reduce((sum, record) => sum + getBalance(record), 0);
+  const targetPct = Math.min(100, Math.round((targetCollected / (targetTotal || 1)) * 100));
+  const schoolTermTargets = useMemo(() => {
+    const grouped = {};
+    targetRecords.forEach((record) => {
+      const key = record.termName || `Term ${record.quarter || 1}`;
+      if (!grouped[key]) grouped[key] = { key, target: 0, collected: 0, pending: 0, quarter: Number(record.quarter) || 0 };
+      grouped[key].target += getNetAmount(record);
+      grouped[key].collected += getPaidAmount(record);
+      grouped[key].pending += getBalance(record);
+    });
+    return Object.values(grouped).sort((a, b) => a.quarter - b.quarter || a.key.localeCompare(b.key));
+  }, [targetRecords]);
+  const classTargetRows = useMemo(() => {
+    const grouped = {};
+    targetRecords.forEach((record) => {
+      const classId = record.classId || record.grade || 'Unknown';
+      if (!grouped[classId]) {
+        grouped[classId] = {
+          classId,
+          className: record.className || classId,
+          target: 0,
+          collected: 0,
+          pending: 0,
+          terms: {},
+        };
+      }
+      const termKey = record.termName || `Term ${record.quarter || 1}`;
+      if (!grouped[classId].terms[termKey]) {
+        grouped[classId].terms[termKey] = { termName: termKey, quarter: Number(record.quarter) || 0, target: 0, collected: 0, pending: 0 };
+      }
+      grouped[classId].target += getNetAmount(record);
+      grouped[classId].collected += getPaidAmount(record);
+      grouped[classId].pending += getBalance(record);
+      grouped[classId].terms[termKey].target += getNetAmount(record);
+      grouped[classId].terms[termKey].collected += getPaidAmount(record);
+      grouped[classId].terms[termKey].pending += getBalance(record);
+    });
+    return Object.values(grouped)
+      .map((row) => ({
+        ...row,
+        progress: Math.min(100, Math.round((row.collected / (row.target || 1)) * 100)),
+        terms: Object.values(row.terms).sort((a, b) => a.quarter - b.quarter || a.termName.localeCompare(b.termName)),
+      }))
+      .sort((a, b) => (a.className || '').localeCompare(b.className || '', undefined, { numeric: true }));
+  }, [targetRecords]);
 
   const fmtDate = (iso) => {
     if (!iso) return '\u2014';
@@ -500,8 +1163,14 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
   };
 
   if (detail) {
-    const balance = Math.max(0, (detail.totalFee || detail.netAmount || 0) - (detail.paid || 0) - (detail.discount || 0) + (detail.fine || 0));
-    const feePct = Math.min(100, Math.round(((detail.paid || 0) / (detail.totalFee || detail.netAmount || 1)) * 100));
+    const detailRecords = Array.isArray(detail.records) && detail.records.length ? detail.records.map(normalizeFeeRecord) : [normalizeFeeRecord(detail)];
+    const activeDetailRecord = detailRecords.find((record) => getBalance(record) > 0) || detailRecords[detailRecords.length - 1];
+    const balance = detailRecords.reduce((sum, record) => sum + getBalance(record), 0);
+    const grossTotal = detailRecords.reduce((sum, record) => sum + getGrossAmount(record), 0);
+    const discountTotal = detailRecords.reduce((sum, record) => sum + getDiscountAmount(record), 0);
+    const paidTotal = detailRecords.reduce((sum, record) => sum + getPaidAmount(record), 0);
+    const netTotal = detailRecords.reduce((sum, record) => sum + getNetAmount(record), 0);
+    const feePct = Math.min(100, Math.round((paidTotal / (netTotal || 1)) * 100));
 
     return (
       <View style={{ flex: 1, backgroundColor: C.navy }}>
@@ -526,7 +1195,10 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
                 </LinearGradient>
                 <View style={{ flex: 1 }}>
                   <Text style={{ fontWeight: '800', fontSize: 17, color: C.white }}>{detail.name || detail.studentName}</Text>
-                  <Text style={{ color: C.muted, fontSize: 12 }}>Grade {detail.grade || detail.classId} {'\u00B7'} {detail.academicYear || ''} Q{detail.quarter || ''}</Text>
+                  <Text style={{ color: C.muted, fontSize: 12 }}>
+                    {detail.className || detail.classId || detail.grade} {'\u00B7'} {activeDetailRecord?.academicYear || detail.academicYear || ''}
+                    {' \u00B7 '}Next: {activeDetailRecord?.termName || `Q${activeDetailRecord?.quarter || 1}`}
+                  </Text>
                   <Text style={{ color: C.muted, fontSize: 11, marginTop: 1 }}>{detail.adm || detail.studentId}</Text>
                 </View>
                 <View style={{ paddingVertical: 4, paddingHorizontal: 12, borderRadius: 99, backgroundColor: FEE_STATUS_COLOR(detail.status) + '22' }}>
@@ -534,7 +1206,7 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
                 </View>
               </View>
               <View style={{ flexDirection: 'row', gap: 6, marginBottom: 14 }}>
-                {[[INR(detail.totalFee || detail.netAmount || 0), 'Total', C.white], [INR(detail.paid || 0), 'Paid', '#34D399'], [INR(detail.discount || 0), 'Discount', C.gold], [INR(balance), 'Balance', balance > 0 ? C.coral : '#34D399']].map(([v, l, c]) => (
+                {[[INR(grossTotal), 'Total', C.white], [INR(paidTotal), 'Paid', '#34D399'], [INR(discountTotal), 'Discount', C.gold], [INR(balance), 'Balance', balance > 0 ? C.coral : '#34D399']].map(([v, l, c]) => (
                   <View key={l} style={{ flex: 1, alignItems: 'center', paddingVertical: 8, paddingHorizontal: 4, backgroundColor: C.navy + '88', borderRadius: 10 }}>
                     <Text style={{ fontWeight: '800', fontSize: 12, color: c }}>{v}</Text>
                     <Text style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>{l}</Text>
@@ -544,9 +1216,16 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
               <View style={st.progressTrack}>
                 <View style={[st.progressFill, { width: feePct + '%', backgroundColor: FEE_STATUS_COLOR(detail.status) }]} />
               </View>
-              {(detail.fine || 0) > 0 && (
+              {detailRecords.length > 1 && (
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 12 }}>
+                  {detailRecords.map((record) => (
+                    <QPill key={record.id || `${record.quarter}-${record.termName}`} label={record.termName || `Q${record.quarter}`} status={detail.quarterStatusMap?.[String(record.quarter)] || 'pending'} />
+                  ))}
+                </View>
+              )}
+              {detailRecords.reduce((sum, record) => sum + (Number(record.fine) || 0), 0) > 0 && (
                 <View style={{ marginTop: 10, paddingVertical: 8, paddingHorizontal: 12, backgroundColor: C.coral + '22', borderWidth: 1, borderColor: C.coral + '44', borderRadius: 10 }}>
-                  <Text style={{ fontSize: 12, color: C.coral }}>{'\u26A0\uFE0F'} Late fine applied: {INR(detail.fine)}</Text>
+                  <Text style={{ fontSize: 12, color: C.coral }}>{'\u26A0\uFE0F'} Late fine applied: {INR(detailRecords.reduce((sum, record) => sum + (Number(record.fine) || 0), 0))}</Text>
                 </View>
               )}
             </LinearGradient>
@@ -556,7 +1235,7 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
                 <Text style={{ fontWeight: '800', fontSize: 14, color: C.navy }}>{'\uD83D\uDCB0'} Mark as Paid</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={() => { setDiscModal(!discModal); setPayModal(false); setNotifyModal(false); }} style={{ flex: 1, paddingVertical: 13, borderRadius: 14, borderWidth: 1.5, borderColor: C.gold + '55', backgroundColor: C.gold + '18', alignItems: 'center' }}>
-                <Text style={{ fontWeight: '700', fontSize: 14, color: C.gold }}>{'\uD83C\uDFF7\uFE0F'} Add Discount</Text>
+                <Text style={{ fontWeight: '700', fontSize: 14, color: C.gold }}>{'\uD83C\uDFF7\uFE0F'} Give Discount</Text>
               </TouchableOpacity>
             </View>
 
@@ -602,9 +1281,10 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
             {payModal && (
               <View style={[st.card, { marginBottom: 16, borderRadius: 18, borderTopWidth: 3, borderTopColor: C.teal }]}>
                 <Text style={{ fontWeight: '700', fontSize: 15, color: C.white, marginBottom: 4 }}>{'\uD83D\uDCB0'} Record Payment</Text>
-                {(detail.netAmount || detail.totalFee) ? (
+                {activeDetailRecord ? (
                   <Text style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
-                    Current fee: <Text style={{ color: C.teal, fontWeight: '700' }}>{INR(detail.netAmount || detail.totalFee)}</Text>
+                    {activeDetailRecord.termName || `Q${activeDetailRecord.quarter}`} due:
+                    <Text style={{ color: C.teal, fontWeight: '700' }}> {INR(getBalance(activeDetailRecord))}</Text>
                   </Text>
                 ) : <View style={{ marginBottom: 14 }} />}
 
@@ -639,45 +1319,81 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
 
             {discModal && (
               <View style={[st.card, { marginBottom: 16, borderRadius: 18, borderTopWidth: 3, borderTopColor: C.gold }]}>
-                <Text style={{ fontWeight: '700', fontSize: 15, color: C.white, marginBottom: 14 }}>{'\uD83C\uDFF7\uFE0F'} Add Discount / Concession</Text>
+                <Text style={{ fontWeight: '700', fontSize: 15, color: C.white, marginBottom: 4 }}>{'\uD83C\uDFF7\uFE0F'} Give Discount</Text>
+                <Text style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>Saved to Firestore and applied across this student's current fee profile.</Text>
+
+                {detailDiscountLoading ? (
+                  <ActivityIndicator size="small" color={C.gold} style={{ marginBottom: 14 }} />
+                ) : null}
+
                 <Text style={st.label}>Discount Type</Text>
-                <TouchableOpacity style={st.inputField} onPress={() => setDiscTypeOpen(true)}>
-                  <Text style={{ color: C.white, fontSize: 15 }}>{newDiscType}</Text>
-                </TouchableOpacity>
-                <Modal visible={discTypeOpen} transparent animationType="fade">
-                  <TouchableOpacity style={st.modalOverlay} onPress={() => setDiscTypeOpen(false)}>
-                    <ScrollView style={{ maxHeight: 400 }} contentContainerStyle={st.modalContent}>
-                      {DISCOUNT_TYPES.map(d => (
-                        <TouchableOpacity key={d} onPress={() => { setNewDiscType(d); setDiscTypeOpen(false); }} style={st.modalItem}>
-                          <Text style={{ color: newDiscType === d ? C.gold : C.white, fontSize: 15, fontWeight: newDiscType === d ? '700' : '400' }}>{d}</Text>
-                        </TouchableOpacity>
-                      ))}
-                    </ScrollView>
-                  </TouchableOpacity>
-                </Modal>
-                <Text style={[st.label, { marginTop: 10 }]}>Discount Amount ({'\u20B9'})</Text>
-                <TextInput style={[st.inputField, { marginBottom: 14 }]} keyboardType="numeric" placeholder="e.g. 3000" placeholderTextColor={C.muted} value={newDiscAmt} onChangeText={setNewDiscAmt} />
+                <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
+                  {[
+                    ['fixed', `Fixed Amount (\u20B9)`],
+                    ['percentage', 'Percentage (%)'],
+                  ].map(([type, label]) => (
+                    <TouchableOpacity
+                      key={type}
+                      onPress={() => setDetailDiscType(type)}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 10,
+                        borderRadius: 12,
+                        alignItems: 'center',
+                        backgroundColor: detailDiscType === type ? C.gold : C.navyMid,
+                        borderWidth: 1.5,
+                        borderColor: detailDiscType === type ? C.gold : C.border,
+                      }}
+                    >
+                      <Text style={{ color: detailDiscType === type ? C.navy : C.muted, fontSize: 12, fontWeight: '700' }}>{label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                <Text style={st.label}>Discount Value {detailDiscType === 'percentage' ? '(%)' : `(\u20B9)`}</Text>
+                <TextInput
+                  style={[st.inputField, { marginBottom: 14 }]}
+                  keyboardType="numeric"
+                  placeholder={detailDiscType === 'percentage' ? 'e.g. 15' : 'e.g. 3000'}
+                  placeholderTextColor={C.muted}
+                  value={detailDiscValue}
+                  onChangeText={setDetailDiscValue}
+                />
+
+                <Text style={st.label}>Reason</Text>
+                <TextInput
+                  style={[st.inputField, { marginBottom: 14, minHeight: 54 }]}
+                  placeholder="e.g. Sibling concession, scholarship"
+                  placeholderTextColor={C.muted}
+                  value={detailDiscReason}
+                  onChangeText={setDetailDiscReason}
+                  multiline
+                />
+
                 <View style={{ flexDirection: 'row', gap: 8 }}>
                   <TouchableOpacity onPress={() => setDiscModal(false)} style={{ flex: 1, paddingVertical: 10, borderRadius: 12, borderWidth: 1, borderColor: C.border, backgroundColor: C.navyMid, alignItems: 'center' }}>
                     <Text style={{ fontWeight: '600', color: C.muted }}>Cancel</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={addDiscount} style={{ flex: 1, paddingVertical: 10, borderRadius: 12, backgroundColor: C.gold, alignItems: 'center' }}>
-                    <Text style={{ fontWeight: '800', color: C.navy }}>{'\u2713'} Apply</Text>
+                  <TouchableOpacity onPress={saveDetailDiscount} disabled={detailDiscountSaving} style={{ flex: 1, paddingVertical: 10, borderRadius: 12, backgroundColor: C.gold, alignItems: 'center', opacity: detailDiscountSaving ? 0.7 : 1 }}>
+                    {detailDiscountSaving ? <ActivityIndicator size="small" color={C.navy} /> : <Text style={{ fontWeight: '800', color: C.navy }}>{'\u2713'} Save</Text>}
                   </TouchableOpacity>
                 </View>
               </View>
             )}
 
-            {(detail.discounts || []).length > 0 && (
+            {detailDiscountMeta && (
               <View>
-                <View style={st.secHead}><Text style={st.secTitle}>Discounts Applied</Text></View>
-                {(detail.discounts || []).map((d, i) => (
-                  <View key={i} style={[st.card, { marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, borderRadius: 14 }]}>
-                    <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: C.gold }} />
-                    <Text style={{ flex: 1, fontWeight: '600', fontSize: 13, color: C.white }}>{d.type}</Text>
-                    <Text style={{ fontWeight: '800', fontSize: 14, color: C.gold }}>{'\u2013'}{INR(d.amount)}</Text>
-                  </View>
-                ))}
+                <View style={st.secHead}><Text style={st.secTitle}>Saved Discount</Text></View>
+                <View style={[st.card, { marginBottom: 12, borderRadius: 14, padding: 14, borderLeftWidth: 3, borderLeftColor: C.gold }]}>
+                  <Text style={{ color: C.white, fontWeight: '700', fontSize: 14, marginBottom: 4 }}>
+                    {detailDiscountMeta.discountType === 'percentage'
+                      ? `${detailDiscountMeta.discountValue}% off`
+                      : `${INR(Number(detailDiscountMeta.discountValue) || 0)} fixed concession`}
+                  </Text>
+                  <Text style={{ color: C.muted, fontSize: 12 }}>
+                    {detailDiscountMeta.reason || 'No reason added'}
+                  </Text>
+                </View>
               </View>
             )}
 
@@ -731,7 +1447,13 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
 
   if (loading) return <LoadingSpinner fullScreen message="Loading fee data..." />;
 
-  const tabDefs = [{ key: 'students', label: 'Students' }, { key: 'classes', label: 'Classes' }, { key: 'settings', label: 'Settings' }, { key: 'reports', label: 'Reports' }];
+  const tabDefs = [
+    { key: 'students', label: 'Students' },
+    { key: 'classes', label: 'Classes' },
+    { key: 'targets', label: 'Targets' },
+    { key: 'settings', label: 'Settings' },
+    { key: 'reports', label: 'Reports' },
+  ];
 
   return (
     <View style={{ flex: 1, backgroundColor: C.navy }}>
@@ -757,6 +1479,173 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
       )}
 
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32, paddingTop: 12 }}>
+        {!selectedClass && (
+          <View style={[st.card, { marginBottom: 20, borderRadius: 18, borderTopWidth: 3, borderTopColor: C.teal }]}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <Text style={{ fontWeight: '800', fontSize: 16, color: C.white }}>{'\uD83C\uDFEB'} Create Fee Structure</Text>
+              <Text style={{ color: C.teal, fontSize: 11, fontWeight: '700' }}>Top Builder</Text>
+            </View>
+            <Text style={{ fontSize: 12, color: C.muted, marginBottom: 18 }}>Assign term-wise fees to a class and auto-create student fee records in one save.</Text>
+
+            {structError ? (
+              <View style={{ marginBottom: 14, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12, backgroundColor: C.coral + '18', borderWidth: 1, borderColor: C.coral + '44' }}>
+                <Text style={{ color: C.coral, fontSize: 12, fontWeight: '700' }}>{structError}</Text>
+              </View>
+            ) : null}
+
+            {structAssignedMessage ? (
+              <View style={{ marginBottom: 14, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12, backgroundColor: '#34D39922', borderWidth: 1, borderColor: '#34D39955' }}>
+                <Text style={{ color: '#34D399', fontSize: 12, fontWeight: '700' }}>{structAssignedMessage}</Text>
+              </View>
+            ) : null}
+
+            <Text style={st.label}>Class</Text>
+            <TouchableOpacity style={st.inputField} onPress={() => setClassDropOpen(true)}>
+              <Text style={{ color: structClassId ? C.white : C.muted, fontSize: 15 }}>{structClassName || 'Select class...'}</Text>
+            </TouchableOpacity>
+            <Modal visible={classDropOpen} transparent animationType="fade">
+              <TouchableOpacity style={st.modalOverlay} onPress={() => setClassDropOpen(false)}>
+                <View style={[st.modalContent, { maxHeight: 340 }]}>
+                  <ScrollView>
+                    {availableClasses.map((cls) => (
+                      <TouchableOpacity
+                        key={cls.classId || cls.id}
+                        onPress={() => {
+                          setStructClassId(cls.classId || cls.id);
+                          setStructClassName(cls.className || cls.name || cls.classId || cls.id);
+                          setClassDropOpen(false);
+                          setStructAssignedMessage('');
+                          setStructError('');
+                        }}
+                        style={st.modalItem}
+                      >
+                        <Text style={{ color: structClassId === (cls.classId || cls.id) ? C.gold : C.white, fontSize: 15 }}>
+                          {cls.className || cls.name || cls.classId || cls.id}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                    {availableClasses.length === 0 && <View style={{ padding: 20 }}><Text style={{ color: C.muted, textAlign: 'center' }}>No classes found</Text></View>}
+                  </ScrollView>
+                </View>
+              </TouchableOpacity>
+            </Modal>
+
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
+              <View style={{ flex: 1 }}>
+                <Text style={st.label}>Academic Year</Text>
+                <TouchableOpacity style={st.inputField} onPress={() => setYearDropOpen(true)}>
+                  <Text style={{ color: C.white, fontSize: 15 }}>{structYear}</Text>
+                </TouchableOpacity>
+                <Modal visible={yearDropOpen} transparent animationType="fade">
+                  <TouchableOpacity style={st.modalOverlay} onPress={() => setYearDropOpen(false)}>
+                    <View style={st.modalContent}>
+                      {ACADEMIC_YEARS.map((year) => (
+                        <TouchableOpacity
+                          key={year}
+                          onPress={() => {
+                            setStructYear(year);
+                            setYearDropOpen(false);
+                            setStructAssignedMessage('');
+                          }}
+                          style={st.modalItem}
+                        >
+                          <Text style={{ color: structYear === year ? C.gold : C.white, fontSize: 15 }}>{year}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </TouchableOpacity>
+                </Modal>
+              </View>
+              <View style={{ width: 120 }}>
+                <Text style={st.label}>No. of Terms</Text>
+                <TextInput
+                  style={st.inputField}
+                  keyboardType="numeric"
+                  value={structTermCount}
+                  onChangeText={(value) => {
+                    const cleaned = value.replace(/[^0-9]/g, '').slice(0, 1) || '1';
+                    setStructTermCount(cleaned);
+                    setStructTerms((prev) => ensureTermRows(cleaned, prev));
+                    setStructAssignedMessage('');
+                  }}
+                  placeholder="1-4"
+                  placeholderTextColor={C.muted}
+                />
+                <Text style={{ color: C.muted, fontSize: 10, marginTop: 6 }}>1 to 4 terms supported</Text>
+              </View>
+            </View>
+
+            <View style={{ marginTop: 18 }}>
+              {structTerms.map((term, index) => (
+                <View key={term.termId || `term-row-${index}`} style={{ marginBottom: 14, padding: 14, borderRadius: 14, backgroundColor: C.navyMid, borderWidth: 1, borderColor: C.border }}>
+                  <Text style={{ color: C.white, fontWeight: '700', fontSize: 13, marginBottom: 12 }}>Term {index + 1}</Text>
+                  <Text style={st.label}>Term Name</Text>
+                  <TextInput
+                    style={[st.inputField, { marginBottom: 10 }]}
+                    value={term.termName}
+                    onChangeText={(value) => setStructTerms((prev) => prev.map((row, rowIndex) => rowIndex === index ? { ...row, termName: value } : row))}
+                    placeholder={`Term ${index + 1}`}
+                    placeholderTextColor={C.muted}
+                  />
+                  <View style={{ flexDirection: 'row', gap: 10 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={st.label}>Fee Amount ({'\u20B9'})</Text>
+                      <TextInput
+                        style={st.inputField}
+                        keyboardType="numeric"
+                        value={term.amount}
+                        onChangeText={(value) => setStructTerms((prev) => prev.map((row, rowIndex) => rowIndex === index ? { ...row, amount: value.replace(/[^0-9]/g, '') } : row))}
+                        placeholder="e.g. 18000"
+                        placeholderTextColor={C.muted}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={st.label}>Due Date</Text>
+                      <TextInput
+                        style={st.inputField}
+                        value={term.dueDate}
+                        onChangeText={(value) => setStructTerms((prev) => prev.map((row, rowIndex) => rowIndex === index ? { ...row, dueDate: value } : row))}
+                        placeholder="YYYY-MM-DD"
+                        placeholderTextColor={C.muted}
+                        autoCapitalize="none"
+                      />
+                    </View>
+                  </View>
+                </View>
+              ))}
+            </View>
+
+            <View style={{ marginBottom: 14, paddingVertical: 12, paddingHorizontal: 14, borderRadius: 14, backgroundColor: C.teal + '18', borderWidth: 1, borderColor: C.teal + '44', flexDirection: 'row', justifyContent: 'space-between' }}>
+              <Text style={{ color: C.muted, fontSize: 13 }}>Total Target for Structure</Text>
+              <Text style={{ color: C.teal, fontWeight: '800', fontSize: 15 }}>{INR(structTerms.reduce((sum, term) => sum + (Number(term.amount) || 0), 0))}</Text>
+            </View>
+
+            <TouchableOpacity onPress={saveStructure} disabled={structSaving} style={{ paddingVertical: 14, borderRadius: 14, backgroundColor: C.teal, alignItems: 'center', opacity: structSaving ? 0.65 : 1 }}>
+              {structSaving ? <ActivityIndicator size="small" color={C.navy} /> : <Text style={{ fontWeight: '800', fontSize: 15, color: C.navy }}>{'\u2713'} Save & Assign Fee Structure</Text>}
+            </TouchableOpacity>
+
+            {currentStructurePreview?.terms?.length ? (
+              <View style={{ marginTop: 18, paddingTop: 16, borderTopWidth: 1, borderTopColor: C.border }}>
+                <Text style={{ color: C.white, fontWeight: '700', fontSize: 13, marginBottom: 10 }}>Saved Structure Preview</Text>
+                {currentStructurePreview.terms.map((term) => (
+                  <View key={`${currentStructurePreview.structureId}-${term.termId || term.termName}`} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8 }}>
+                    <View>
+                      <Text style={{ color: C.white, fontSize: 13, fontWeight: '600' }}>{term.termName}</Text>
+                      <Text style={{ color: C.muted, fontSize: 11 }}>{term.dueDate}</Text>
+                    </View>
+                    <Text style={{ color: C.teal, fontWeight: '700', fontSize: 13 }}>{INR(Number(term.amount) || 0)}</Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+
+            {structuresLoading ? (
+              <ActivityIndicator size="small" color={C.teal} style={{ marginTop: 14 }} />
+            ) : currentYearStructures.length > 0 ? (
+              <Text style={{ color: C.muted, fontSize: 11, marginTop: 14 }}>{currentYearStructures.length} structure{currentYearStructures.length !== 1 ? 's' : ''} saved for {structYear}</Text>
+            ) : null}
+          </View>
+        )}
 
         {activeTab === 'students' && !selectedClass && (
           <>
@@ -793,8 +1682,8 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
             </View>
 
             {filteredStudents.map(s => {
-              const bal = Math.max(0, (s.totalFee || 0) - (s.paid || 0) - (s.discount || 0) + (s.fine || 0));
-              const pct = Math.min(100, Math.round(((s.paid || 0) / (s.totalFee || 1)) * 100));
+              const bal = getBalance(s);
+              const pct = Math.min(100, Math.round((getPaidAmount(s) / (getNetAmount(s) || 1)) * 100));
               return (
                 <TouchableOpacity key={s.id} onPress={() => setDetail(s)} style={[st.card, { borderLeftWidth: 3, borderLeftColor: FEE_STATUS_COLOR(s.status), marginBottom: 10, borderColor: s.status === 'Overdue' ? C.coral + '55' : C.border, borderRadius: 16, padding: 16 }]}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 12 }}>
@@ -813,9 +1702,9 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
                     </View>
                   </View>
                   <View style={{ flexDirection: 'row', gap: 10, marginBottom: 8 }}>
-                    <Text style={{ fontSize: 11, color: C.muted }}>Total: <Text style={{ fontWeight: '700', color: C.white }}>{INR(s.totalFee || s.netAmount || 0)}</Text></Text>
-                    <Text style={{ fontSize: 11, color: C.muted }}>Paid: <Text style={{ fontWeight: '700', color: '#34D399' }}>{INR(s.paid || 0)}</Text></Text>
-                    {(s.discount || 0) > 0 && <Text style={{ fontSize: 11, color: C.muted }}>Disc: <Text style={{ fontWeight: '700', color: C.gold }}>{'\u2013'}{INR(s.discount)}</Text></Text>}
+                    <Text style={{ fontSize: 11, color: C.muted }}>Total: <Text style={{ fontWeight: '700', color: C.white }}>{INR(getNetAmount(s))}</Text></Text>
+                    <Text style={{ fontSize: 11, color: C.muted }}>Paid: <Text style={{ fontWeight: '700', color: '#34D399' }}>{INR(getPaidAmount(s))}</Text></Text>
+                    {(getDiscountAmount(s) || 0) > 0 && <Text style={{ fontSize: 11, color: C.muted }}>Disc: <Text style={{ fontWeight: '700', color: C.gold }}>{'\u2013'}{INR(getDiscountAmount(s))}</Text></Text>}
                   </View>
                   <View style={[st.progressTrack, { height: 5 }]}>
                     <View style={[st.progressFill, { width: pct + '%', backgroundColor: FEE_STATUS_COLOR(s.status) }]} />
@@ -837,8 +1726,8 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
               </View>
             )}
             {classesByGroup.map(cls => {
-              const paid = cls.students.filter(s => s.status === 'paid' || s.status === 'Cleared').length;
-              const overdue = cls.students.filter(s => s.status === 'overdue' || s.status === 'Overdue').length;
+              const paid = cls.students.filter(s => s.status === 'Cleared').length;
+              const overdue = cls.students.filter(s => s.status === 'Overdue').length;
               const pending = cls.students.length - paid - overdue;
               return (
                 <TouchableOpacity key={cls.classId} onPress={() => setSelectedClass(cls)} style={[st.card, { marginBottom: 12, borderRadius: 16, padding: 18, borderLeftWidth: 3, borderLeftColor: C.teal }]}>
@@ -873,16 +1762,8 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
               </View>
             )}
             {classStudents.map(s => {
-              const balance = Math.max(0, (s.totalFee || s.netAmount || 0) - (s.paid || 0) - (s.discount || 0) + (s.fine || 0));
-              const qStatus = (q) => {
-                if (s.quarter === q || s.quarter === String(q)) {
-                  const st2 = (s.status || '').toLowerCase();
-                  if (st2 === 'cleared' || st2 === 'paid') return 'paid';
-                  if (st2 === 'overdue') return 'overdue';
-                  return 'pending';
-                }
-                return 'upcoming';
-              };
+              const balance = getBalance(s);
+              const qStatus = (q) => s.quarterStatusMap?.[String(q)] || 'upcoming';
               return (
                 <TouchableOpacity key={s.id || s.studentId} onPress={() => setDetail(s)} style={[st.card, { marginBottom: 10, borderRadius: 16, padding: 16, borderLeftWidth: 3, borderLeftColor: FEE_STATUS_COLOR(s.status) }]}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 8 }}>
@@ -904,11 +1785,108 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
           </>
         )}
 
+        {activeTab === 'targets' && !selectedClass && (
+          <>
+            <View style={[st.card, { marginBottom: 16, borderRadius: 18, borderTopWidth: 3, borderTopColor: C.teal }]}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+                <Text style={{ fontWeight: '800', fontSize: 16, color: C.white }}>{'\uD83D\uDCCA'} School Fee Targets</Text>
+                <TouchableOpacity style={[st.inputField, { width: 126, paddingVertical: 10, marginBottom: 0 }]} onPress={() => setTargetYearDropOpen(true)}>
+                  <Text style={{ color: C.white, fontSize: 13 }}>{targetYear}</Text>
+                </TouchableOpacity>
+              </View>
+              <Modal visible={targetYearDropOpen} transparent animationType="fade">
+                <TouchableOpacity style={st.modalOverlay} onPress={() => setTargetYearDropOpen(false)}>
+                  <View style={st.modalContent}>
+                    {ACADEMIC_YEARS.map((year) => (
+                      <TouchableOpacity key={year} onPress={() => { setTargetYear(year); setTargetYearDropOpen(false); }} style={st.modalItem}>
+                        <Text style={{ color: targetYear === year ? C.gold : C.white, fontSize: 15 }}>{year}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </TouchableOpacity>
+              </Modal>
+
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
+                {[
+                  [INR(targetTotal), 'Total Target', C.white],
+                  [INR(targetCollected), 'Collected', '#34D399'],
+                  [INR(targetPending), 'Pending', C.coral],
+                ].map(([value, label, color]) => (
+                  <View key={label} style={{ flex: 1, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 6, backgroundColor: C.navy + '88', borderRadius: 12 }}>
+                    <Text style={{ color, fontWeight: '800', fontSize: 13 }}>{value}</Text>
+                    <Text style={{ color: C.muted, fontSize: 10, marginTop: 3 }}>{label}</Text>
+                  </View>
+                ))}
+              </View>
+
+              <View style={[st.progressTrack, { height: 10 }]}>
+                <View style={[st.progressFill, { width: `${targetPct}%`, backgroundColor: '#34D399' }]} />
+              </View>
+              <Text style={{ color: C.muted, fontSize: 11, marginTop: 8 }}>{targetPct}% of school fee target collected</Text>
+            </View>
+
+            <View style={[st.card, { marginBottom: 16, borderRadius: 18 }]}>
+              <Text style={{ color: C.white, fontWeight: '700', fontSize: 15, marginBottom: 14 }}>{'\uD83D\uDCCB'} Collected vs Pending Per Term</Text>
+              {schoolTermTargets.length === 0 ? (
+                <Text style={{ color: C.muted, fontSize: 12, textAlign: 'center' }}>No assigned fee records found for {targetYear}.</Text>
+              ) : schoolTermTargets.map((term) => (
+                <View key={term.key} style={{ paddingVertical: 10, borderTopWidth: schoolTermTargets[0] === term ? 0 : 1, borderTopColor: C.border + '55' }}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <Text style={{ color: C.white, fontWeight: '700', fontSize: 13 }}>{term.key}</Text>
+                    <Text style={{ color: C.teal, fontWeight: '700', fontSize: 13 }}>{INR(term.target)}</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                    <Text style={{ color: '#34D399', fontSize: 12 }}>Collected: {INR(term.collected)}</Text>
+                    <Text style={{ color: C.coral, fontSize: 12 }}>Pending: {INR(term.pending)}</Text>
+                  </View>
+                </View>
+              ))}
+            </View>
+
+            {classTargetRows.map((row) => (
+              <View key={row.classId} style={[st.card, { marginBottom: 12, borderRadius: 18, borderLeftWidth: 3, borderLeftColor: row.pending > 0 ? C.gold : '#34D399' }]}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: C.white, fontWeight: '800', fontSize: 15 }}>{row.className}</Text>
+                    <Text style={{ color: C.muted, fontSize: 11 }}>{row.progress}% collected</Text>
+                  </View>
+                  <Text style={{ color: C.teal, fontWeight: '800', fontSize: 13 }}>{INR(row.target)}</Text>
+                </View>
+
+                <View style={[st.progressTrack, { height: 8, marginBottom: 12 }]}>
+                  <View style={[st.progressFill, { width: `${row.progress}%`, backgroundColor: row.pending > 0 ? C.gold : '#34D399' }]} />
+                </View>
+
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10 }}>
+                  <Text style={{ color: '#34D399', fontSize: 12 }}>Collected: {INR(row.collected)}</Text>
+                  <Text style={{ color: C.coral, fontSize: 12 }}>Pending: {INR(row.pending)}</Text>
+                </View>
+
+                <View style={{ borderTopWidth: 1, borderTopColor: C.border + '55', paddingTop: 10 }}>
+                  <View style={{ flexDirection: 'row', marginBottom: 8 }}>
+                    <Text style={{ flex: 1.1, color: C.muted, fontSize: 10, fontWeight: '700' }}>TERM</Text>
+                    <Text style={{ flex: 1, color: C.muted, fontSize: 10, fontWeight: '700', textAlign: 'right' }}>TARGET</Text>
+                    <Text style={{ flex: 1, color: C.muted, fontSize: 10, fontWeight: '700', textAlign: 'right' }}>COLLECTED</Text>
+                    <Text style={{ flex: 1, color: C.muted, fontSize: 10, fontWeight: '700', textAlign: 'right' }}>PENDING</Text>
+                  </View>
+                  {row.terms.map((term) => (
+                    <View key={`${row.classId}-${term.termName}`} style={{ flexDirection: 'row', paddingVertical: 7, borderTopWidth: 1, borderTopColor: C.border + '33' }}>
+                      <Text style={{ flex: 1.1, color: C.white, fontSize: 12 }}>{term.termName}</Text>
+                      <Text style={{ flex: 1, color: C.teal, fontSize: 12, textAlign: 'right' }}>{INR(term.target)}</Text>
+                      <Text style={{ flex: 1, color: '#34D399', fontSize: 12, textAlign: 'right' }}>{INR(term.collected)}</Text>
+                      <Text style={{ flex: 1, color: C.coral, fontSize: 12, textAlign: 'right' }}>{INR(term.pending)}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            ))}
+          </>
+        )}
+
         {activeTab === 'settings' && (
           <>
-            <View style={[st.card, { marginBottom: 20, borderRadius: 18, borderTopWidth: 3, borderTopColor: C.teal }]}>
-              <Text style={{ fontWeight: '700', fontSize: 16, color: C.white, marginBottom: 4 }}>{'\uD83C\uDFEB'} Fee Structure</Text>
-              <Text style={{ fontSize: 12, color: C.muted, marginBottom: 18 }}>Set quarterly fee amounts per class</Text>
+            {false ? (
+              <>
 
               <Text style={st.label}>Class</Text>
               <TouchableOpacity style={st.inputField} onPress={() => setClassDropOpen(true)}>
@@ -1001,7 +1979,8 @@ export default function AdminFeeScreen({ onBack, currentUser }) {
                   </TouchableOpacity>
                 </View>
               )}
-            </View>
+              </>
+            ) : null}
 
             <View style={[st.card, { marginBottom: 20, borderRadius: 18, borderTopWidth: 3, borderTopColor: C.gold }]}>
               <Text style={{ fontWeight: '700', fontSize: 16, color: C.white, marginBottom: 4 }}>{'\uD83C\uDFF7\uFE0F'} Student Discounts</Text>
